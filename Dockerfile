@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch "${JACKTRIP_VERSION}" https://github.com/jacktrip/jacktrip.git /src/jacktrip
 WORKDIR /src/jacktrip
-RUN meson setup build --buildtype=release -Dnogui=true -Dnovs=true -Dnooscpp=true -Dnoupdater=true \
+RUN meson setup builddir --buildtype=release -Dnogui=true -Dnovs=true -Dnooscpp=true -Dnoupdater=true \
       -Drtaudio=disabled -Dlibsamplerate=disabled -Dqtversion=6 \
     && ninja -C build \
     && install -D build/jacktrip /out/usr/local/bin/jacktrip
