@@ -60,6 +60,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  deploy:
+    name: Deploy floverse (Coolify-Service neu starten, :latest ziehen)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions: {}
+    concurrency:
+      group: deploy-floverse
+      cancel-in-progress: false
+    env:
+      COOLIFY_API: https://coolify.kailohmann.de/api/v1
+      COOLIFY_SERVICE: p4zmxxh0jpal4mvbvbn673mn
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+    steps:
+      # Raw-Compose-Service: /deploy dokumentiert kein Ziehen neuer Images (nur force = Neubau ohne Cache);
+      # POST /services/{uuid}/restart?latest=true ist laut Coolify-API-Doku "Pull latest images" + Neustart.
+      - name: Service neu starten (latest=true)
+        run: |
+          if [ -z "${COOLIFY_TOKEN}" ]; then
+            echo "::notice title=Deploy übersprungen::Secret COOLIFY_TOKEN fehlt - Service ${COOLIFY_SERVICE} wurde nicht neu gestartet."
+            echo "Deploy übersprungen: Secret COOLIFY_TOKEN fehlt." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}" -H "Accept: application/json" \
+            "${COOLIFY_API}/services/${COOLIFY_SERVICE}/restart?latest=true")
+          echo "HTTP ${code}"; cat /tmp/resp.json; echo
+          echo "Coolify-Restart ${COOLIFY_SERVICE} (latest=true): HTTP ${code}" >> "$GITHUB_STEP_SUMMARY"
+          test "${code}" -ge 200 -a "${code}" -lt 300
+
   integration:
     name: Integrationstest (Docker + tc netem)
     runs-on: ubuntu-latest
@@ -97,6 +128,7 @@ jobs:
             ${{ runner.temp }}/itest/*/analysis.json
             ${{ runner.temp }}/itest/*/status.jsonl
             ${{ runner.temp }}/itest/*/compose.log
+            ${{ runner.temp }}/itest/*/logs/*.log
             ${{ runner.temp }}/itest/*/rec/*.trace.jsonl
           if-no-files-found: warn
           retention-days: 30

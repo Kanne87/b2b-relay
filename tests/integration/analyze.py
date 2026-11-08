@@ -136,6 +136,8 @@ def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = Non
             "gaps_total": len(gaps_all), "max_gap_ms": round(max((g[1] for g in gaps_all), default=0) / FS * 1e3, 2),
             "max_jump_ratio": max((p["max_jump_ratio"] for p in per), default=None),
             "xruns": int(blk[-1]["xr"]) if blk else None,
+            # nur während des Mitschnitts (die Startphase von jackd/b2b-relay liegt davor und trifft kein Programm)
+            "xruns_recording": int(blk[-1]["xr"] - blk[0]["xr"]) if blk else None,
             "buffer_min_s": round(float(b.min()), 3), "buffer_max_s": round(float(b.max()), 3),
             "rate_min": round(float(r.min()), 5), "rate_max": round(float(r.max()), 5),
             "drift_max_abs_ms": round(float(np.abs(d[len(d) // 10:]).max()), 3) if len(d) else None,
@@ -165,7 +167,7 @@ def acceptance(res: dict, profile: str) -> dict:
         "no_phase_jump_missing": s["phase_jump_missing"] == 0,
         f"phase_jump<={lim['phase_ms']}ms": bool(s["phase_jump_max_abs_ms"] <= lim["phase_ms"]),
         "no_fallback": res["fallbacks"] == 0,
-        "xruns==0": s["xruns"] == 0,
+        "xruns==0": s["xruns_recording"] == 0,
         "buffer>=min": s["buffer_min_s"] >= 0.95,
         "rate_within_0.5%": s["rate_min"] >= 0.995 - 1e-4 and s["rate_max"] <= 1.005 + 1e-4,
         "drift<10ms": s["drift_max_abs_ms"] is not None and s["drift_max_abs_ms"] < 10.0,

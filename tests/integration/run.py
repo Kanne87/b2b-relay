@@ -36,10 +36,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 COMPOSE = HERE / "docker-compose.yml"
 
+# ``rate 1000mbit``: netem plant jedes Paket frühestens hinter dem vorigen ein. Ohne ``rate`` sortiert netem
+# nach individueller Verzögerung - bei 5 ms Jitter und 5,33 ms Paketabstand kämen ~23 % der JackTrip-Pakete
+# hinter ihrem Nachfolger an und gingen als Lücke verloren (wan40 in Run 42515682729: ~41 Lücken/s zu
+# 3-5 Paketen, Relay ohne Unterlauf). Gewolltes Umordnen steht ausdrücklich da (``reorder`` in wan120).
 PROFILES = {
     "clean": "",
-    "wan40": "delay 40ms 5ms distribution normal",
-    "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50%",
+    "wan40": "delay 40ms 5ms distribution normal rate 1000mbit",
+    "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit",
 }
 DJS = ["A", "B", "C"]
 
