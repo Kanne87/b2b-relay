@@ -24,6 +24,7 @@ Programm als Rückkanal hört, kommt um den Lag der Programmquelle plus ihre eig
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -215,7 +216,7 @@ class RelayMixer:
         self._sil_thr = 10.0 ** (c.silence_db / 20.0)
         self._sil_timeout = int(c.silence_timeout_s * self.fs)
         self._rearm = int(c.rearm_silence_s * self.fs)
-        self.events: list[Event] = []
+        self.events: deque[Event] = deque(maxlen=4096)    # begrenzt: läuft über Stunden
         self._t_blk = -self._D          # Programmzeit des Ausgabeblocks, der gerade entsteht
         self.last_block: BlockInfo | None = None
         self._stage: VarispeedReader | None = None
@@ -235,6 +236,14 @@ class RelayMixer:
         tracker = LagTracker(gate=c.gate_s * self.fs, rate_limit=c.max_rate_ppm * 1e-6,
                              min_conf=c.min_conf)
         self._sources[name] = _Source(name, SampleRing(int(c.ring_s * self.fs)), tracker, rtt_hint_s)
+
+    def set_lag(self, name: str, lag_s: float) -> None:
+        """Lag einer Quelle von außen vorgeben (z. B. aus einer anderen Messung; ohne Audio-
+        Schätzung). Die Quelle gilt dann als eingerastet, mit Driftrate 0."""
+        s = self._get(name)
+        if s.is_reference and name == self._active:
+            raise ValueError("Lag der aktiven Quelle ist durch die Zeitachse festgelegt")
+        s.tracker.set_reference(lag_s * self.fs, float(self._wall))
 
     def set_active(self, name: str) -> None:
         """Erste Quelle aktivieren: sie definiert die Zeitachse (lag 0)."""

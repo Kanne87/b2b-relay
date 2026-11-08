@@ -10,7 +10,6 @@ import numpy as np
 
 from ..mixer import RelayConfig, RelayMixer
 from ..timeline import frac_read
-from ..varispeed import sinc_frac_read
 from .analysis import find_gaps, kick_phase_errors, max_sample_jump
 from .dj import SimDJ
 from .plan import Plan, PlanConfig
@@ -97,7 +96,11 @@ class _ProgramView:
     def __getitem__(self, sl: slice) -> np.ndarray:
         a, b = sl.start or 0, sl.stop if sl.stop is not None else self.length
         T = np.arange(a, b, dtype=np.float64)
-        return sinc_frac_read(self.outs, self.omap.j_of(T)).astype(np.float32)
+        j = self.omap.j_of(T)
+        i0 = max(int(np.floor(j[0])) - 2, 0)
+        i1 = int(np.floor(j[-1])) + 4
+        # kubisch genügt für die Messungen (Kick-Band 80 Hz, Lücken, Sprünge) und ist 20× billiger
+        return frac_read(self.outs[i0:i1], j - i0).astype(np.float32)
 
 
 def _solve_arrival(stint, t: float) -> float:

@@ -113,21 +113,3 @@ class VarispeedReader:
         self.pos_frac = total - step
         return out
 
-
-def sinc_frac_read(buf: np.ndarray, pos: np.ndarray) -> np.ndarray:
-    """Sinc-Interpolation von ``buf`` an beliebigen Bruchteil-Positionen ``pos`` (Index im Array).
-
-    Positionen ohne volle Nachbarschaft (näher als 16 Samples am Rand) ergeben 0. Wird von der
-    Simulation benutzt, um den zeitverzerrten Ausgang wieder auf das Programm-Zeitraster zu
-    bringen (Messung in Programmzeit)."""
-    tab = sinc_table()
-    H = tab.half
-    pos = np.asarray(pos, dtype=np.float64)
-    ip = np.floor(pos).astype(np.int64)
-    frac = pos - ip
-    ok = (ip >= H - 1) & (ip <= buf.shape[0] - 1 - H)
-    ipc = np.clip(ip, H - 1, buf.shape[0] - 1 - H)
-    m = (frac * tab.phases + 0.5).astype(np.int64)
-    y = np.einsum("ik,ik->i", np.asarray(buf, dtype=np.float64)[ipc[:, None] + tab.k[None, :]],
-                  tab.rows[m])
-    return np.where(ok, y, 0.0)
