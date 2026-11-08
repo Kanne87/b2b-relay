@@ -180,7 +180,9 @@ class Dj:
             pass
 
     def _connect(self) -> None:
-        deadline = time.time() + 60
+        import jack
+        deadline = time.time() + 120
+        err = None
         while time.time() < deadline:
             # Namensunabhängig: im Hub-Client-Modus heißt der lokale JackTrip-Client nicht verlässlich
             # "JackTrip" – jeder fremde Client mit receive_/send_-Ports ist JackTrip (S3788).
@@ -191,13 +193,21 @@ class Dj:
             tx = [p for p in self.c.get_ports(r":send_[0-9]+$", is_audio=True, is_input=True)
                   if not p.name.startswith(own)]
             if len(rx) >= 2 and len(tx) >= 2:
-                for k in range(2):
-                    self.c.connect(rx[k], self.i[k])
-                    self.c.connect(self.o[k], tx[k])
-                return
+                # JackTrip legt seine Ports an, bevor der Client aktiv ist (Handshake mit dem Hub läuft
+                # noch; unter netem 120 ms dauert das Sekunden): "Cannot connect ports owned by inactive
+                # clients" - dann erneut versuchen statt abzubrechen (wan120 in Run 42515682729, S3788).
+                try:
+                    for k in range(2):
+                        if self.i[k].name not in {q.name for q in self.c.get_all_connections(rx[k])}:
+                            self.c.connect(rx[k], self.i[k])
+                        if tx[k].name not in {q.name for q in self.c.get_all_connections(self.o[k])}:
+                            self.c.connect(self.o[k], tx[k])
+                    return
+                except jack.JackError as e:
+                    err = e
             time.sleep(0.5)
         names = [p.name for p in self.c.get_ports()]
-        raise SystemExit(f"JackTrip-Ports nicht erschienen; vorhandene Ports: {names}")
+        raise SystemExit(f"JackTrip-Ports nicht verbindbar (letzter Fehler: {err}); vorhandene Ports: {names}")
 
 
 if __name__ == "__main__":
