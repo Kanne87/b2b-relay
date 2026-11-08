@@ -98,3 +98,46 @@ def test_runner_dry_run_shows_plan_without_docker():
     one = subprocess.run([sys.executable, str(ITEST / "run.py"), "--dry-run", "--profiles", "clean", "--handovers", "2"],
                          capture_output=True, text=True, timeout=60)
     assert one.returncode == 0 and "wan40" not in one.stdout and "2 Übergaben" in one.stdout
+
+
+FAKE_DOCKER = """#!/bin/sh
+# docker-Ersatz: Stack startet, clientA ist sofort beendet (wie wan120 in Run 42515682729)
+case "$*" in
+  *" ps "*) echo clientA ;;
+  *" config --services"*) printf 'server\\nclientA\\n' ;;
+  *" logs "*) for i in $(seq 1 300); do echo "$4 Zeile $i"; done; echo "letzte Zeile von $*" ;;
+  *) : ;;
+esac
+exit 0
+"""
+
+
+def test_runner_aborted_profile_dumps_logs_and_writes_analysis(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "docker").write_text(FAKE_DOCKER)
+    (bindir / "docker").chmod(0o755)
+    out = tmp_path / "out"
+    env = {**__import__("os").environ, "PATH": f"{bindir}:" + __import__("os").environ["PATH"]}
+    r = subprocess.run([sys.executable, str(ITEST / "run.py"), "--profiles", "clean,wan120", "--handovers", "1",
+                        "--out", str(out), "--api-port", "9", "--no-build"],
+                       capture_output=True, text=True, timeout=120, env=env)
+    assert r.returncode == 1, r.stderr
+    assert "Container beendet: clientA" in r.stdout
+    assert "Compose-Log b2bit-clean/clientA (letzte 200 Zeilen)" in r.stdout
+    assert "letzte Zeile von" in r.stdout and "--tail 200 clientA" in r.stdout
+    for prof in ("clean", "wan120"):                      # der Abbruch des ersten Profils hält das zweite nicht auf
+        res = json.loads((out / prof / "analysis.json").read_text())
+        assert res["profile"] == prof and "Container beendet" in res["error"]
+        assert res["acceptance"]["passed"] is False and res["completed"] is False
+        assert (out / prof / "logs" / "clientA.log").exists()
+    assert len(json.loads((out / "results.json").read_text())) == 2
+    assert "abgebrochen" in (out / "report.md").read_text()
+
+
+def test_mark_incomplete_keeps_measurements(tmp_path):
+    wav, tr = _synthetic_run(tmp_path, jump_ms=0.4)
+    res = analyze.mark_incomplete(analyze.analyze_profile(wav, tr, "clean"), "TimeoutError: x")
+    assert res["per_handover"][0]["phase_jump_ms"] == pytest.approx(0.4, abs=0.1)
+    assert res["acceptance"]["passed"] is False and res["error"] == "TimeoutError: x"
+    assert "Abgebrochen" in analyze.markdown([res])

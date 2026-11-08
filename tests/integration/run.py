@@ -12,6 +12,11 @@ zum gehörten Feed dazu), wartet auf die RTT-Einrastung, ruft ``POST /handover``
 der genannten Wartezeit erneut) und lässt den Rest der Haltezeit laufen. Danach Auswertung des
 Programm-Mitschnitts (``analyze.py``): Ergebnis als ``results.json`` und ``report.md``.
 Exit 0, wenn alle Abnahmekriterien aller Profile erfüllt sind (``--no-fail``: immer 0).
+
+Bricht ein Profil ab (Zeitüberschreitung, beendeter Container, Fehler der Auswertung), gibt der Lauf die
+letzten ``--log-lines`` (200) Zeilen der Compose-Logs je Container aus (auch nach ``<profil>/logs/``),
+wertet den Mitschnitt aus, soweit er reicht, und schreibt ``analysis.json`` mit Feld ``error``; die übrigen
+Profile laufen weiter, ``results.json`` und ``report.md`` entstehen in jedem Fall.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -36,6 +42,10 @@ PROFILES = {
     "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50%",
 }
 DJS = ["A", "B", "C"]
+
+
+class ProfileAbort(RuntimeError):
+    """Profil vorzeitig beendet (Zeitüberschreitung, Container weg)."""
 
 
 class Runner:
@@ -79,16 +89,47 @@ class Runner:
             v = fn()
             if v:
                 return v
+            self.check_alive()
             time.sleep(every)
         raise TimeoutError(f"Zeitüberschreitung: {what} ({timeout:.0f} s)")
+
+    # ---------------------------------------------------------------- Container
+    def compose_cmd(self) -> list[str]:
+        return ["docker", "compose", "-f", str(COMPOSE), "-p", self.proj]
+
+    def check_alive(self) -> None:
+        """Bricht ab, wenn ein Container des Profils beendet ist (statt bis zur Zeitüberschreitung zu warten)."""
+        if self.a.dry_run or not getattr(self, "proj", None):
+            return
+        r = subprocess.run(self.compose_cmd() + ["ps", "-a", "--status", "exited", "--services"],
+                           env={**os.environ, **self.env}, capture_output=True, text=True, check=False)
+        dead = [x for x in r.stdout.split() if x]
+        if dead:
+            raise ProfileAbort(f"Container beendet: {', '.join(dead)}")
+
+    def dump_logs(self, d: Path, lines: int) -> None:
+        """Letzte ``lines`` Zeilen je Container ausgeben und unter ``d/logs/<dienst>.log`` ablegen."""
+        env = {**os.environ, **self.env}
+        r = subprocess.run(self.compose_cmd() + ["config", "--services"], env=env, capture_output=True,
+                           text=True, check=False)
+        (d / "logs").mkdir(parents=True, exist_ok=True)
+        for svc in [x for x in r.stdout.split() if x]:
+            lg = subprocess.run(self.compose_cmd() + ["logs", "--no-color", "--tail", str(lines), svc], env=env,
+                                capture_output=True, text=True, check=False)
+            text = lg.stdout + lg.stderr
+            (d / "logs" / f"{svc}.log").write_text(text)
+            print(f"::group::Compose-Log {self.proj}/{svc} (letzte {lines} Zeilen)", flush=True)
+            print(text.rstrip(), flush=True)
+            print("::endgroup::", flush=True)
 
     # ---------------------------------------------------------------- ein Profil
     def profile(self, name: str, netem: str) -> dict:
         a = self.a
         d = self.out / name
-        proj = f"b2bit-{name}"
-        env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port)}
-        compose = ["docker", "compose", "-f", str(COMPOSE), "-p", proj]
+        self.proj = f"b2bit-{name}"
+        self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port)}
+        compose = self.compose_cmd()
+        error: str | None = None
         self.say(f"\n=== Profil {name}: netem {netem or '(keine Störung)'} ===")
         if not a.dry_run:
             for sub in ("rec", "ctl"):
@@ -96,12 +137,12 @@ class Runner:
                 os.chmod(d / sub, 0o777)
             (d / "ctl" / "next").write_text("")
             os.chmod(d / "ctl" / "next", 0o666)
-        self.say("  [1] Stack starten")
-        self.sh(compose + ["up", "-d"] + ([] if a.no_build else ["--build"]), env)
         status_log = d / "status.jsonl"
         stop = threading.Event()
         reqs: list[dict] = []
         try:
+            self.say("  [1] Stack starten")
+            self.sh(compose + ["up", "-d"] + ([] if a.no_build else ["--build"]), env)
             self.say("  [2] warten auf /healthz und auf die DJs A, B, C (Clients present)")
             if not a.dry_run:
                 self.wait("Server-API", lambda: self.http("GET", "/healthz")[0] == 200, 120)
@@ -121,6 +162,13 @@ class Runner:
             self.say(f"  [5] Nachlauf {a.settle_s:.0f} s, Mitschnitt schließen")
             if not a.dry_run:
                 time.sleep(a.settle_s)
+                self.check_alive()
+        except Exception as e:          # Profil abgebrochen: Logs sichern (Container laufen noch), Rest auswerten
+            error = f"{type(e).__name__}: {e}"
+            self.say(f"  !! Profil {name} abgebrochen: {error}")
+            traceback.print_exc()
+            if not a.dry_run:
+                self.dump_logs(d, a.log_lines)
         finally:
             stop.set()
             if not a.dry_run:
@@ -133,10 +181,20 @@ class Runner:
         if a.dry_run:
             return {"profile": name, "dry_run": True}
         import analyze
+        res = None
         wavs = sorted((d / "rec").glob("program-*.wav"))
         if not wavs:
-            raise RuntimeError(f"kein Mitschnitt in {d / 'rec'} (siehe {d / 'compose.log'})")
-        res = analyze.analyze_profile(wavs[-1], wavs[-1].with_suffix(".trace.jsonl"), name, status_log, reqs)
+            error = (error + "; " if error else "") + f"kein Mitschnitt in {d / 'rec'}"
+        else:
+            try:
+                res = analyze.analyze_profile(wavs[-1], wavs[-1].with_suffix(".trace.jsonl"), name, status_log, reqs)
+            except Exception as e:
+                traceback.print_exc()
+                error = (error + "; " if error else "") + f"Auswertung: {type(e).__name__}: {e}"
+        if res is None:
+            res = analyze.incomplete(name, error or "unbekannt", reqs)
+        elif error:
+            res = analyze.mark_incomplete(res, error)
         (d / "analysis.json").write_text(json.dumps(res, indent=1))
         return res
 
@@ -166,6 +224,7 @@ class Runner:
             rec["lock_timeout"] = str(e)
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline:
+            self.check_alive()
             rec["attempts"] += 1
             code, js = self.http("POST", "/handover", {"to": to})
             if code == 200:
@@ -203,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--token", default=os.environ.get("B2B_API_TOKEN", ""))
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--no-fail", action="store_true", help="Exit 0 auch bei verfehlter Abnahme")
+    ap.add_argument("--log-lines", type=int, default=200, help="Compose-Log-Zeilen je Container bei Abbruch")
     a = ap.parse_args(argv)
     names = [p.strip() for p in a.profiles.split(",") if p.strip()]
     for n in names:
@@ -215,7 +275,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Ausgabe: {r.out}   (results.json, report.md, je Profil rec/*.wav + *.trace.jsonl, status.jsonl)")
     results = []
     for n in names:
-        results.append(r.profile(n, PROFILES[n]))
+        try:
+            results.append(r.profile(n, PROFILES[n]))
+        except Exception as e:      # Fehler des Harness selbst: Profil als abgebrochen führen, weiter
+            traceback.print_exc()
+            if a.dry_run:
+                raise
+            import analyze
+            res = analyze.incomplete(n, f"{type(e).__name__}: {e}")
+            (r.out / n).mkdir(parents=True, exist_ok=True)
+            (r.out / n / "analysis.json").write_text(json.dumps(res, indent=1))
+            results.append(res)
     if a.dry_run:
         print("\n[Trockenlauf] Danach: results.json + report.md schreiben; Exit 1, wenn eine Abnahme verfehlt wird.")
         return 0

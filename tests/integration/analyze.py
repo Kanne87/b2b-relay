@@ -176,18 +176,41 @@ def acceptance(res: dict, profile: str) -> dict:
     return ok
 
 
+def incomplete(profile: str, error: str, handovers: list[dict] | None = None) -> dict:
+    """Ergebnis eines Profils ohne auswertbaren Mitschnitt (Abbruch vor dem Start der Aufnahme)."""
+    res = {"profile": profile, "error": error, "completed": False, "handovers_effective": 0,
+           "handovers_refused": 0, "fallbacks": 0, "per_handover": [], "summary": {}, "series": []}
+    if handovers is not None:
+        res["handover_requests"] = handovers
+    res["acceptance"] = {"completed": False, "passed": False}
+    return res
+
+
+def mark_incomplete(res: dict, error: str) -> dict:
+    """Ausgewertetes, aber abgebrochenes Profil: Fehler vermerken, Abnahme gilt als verfehlt."""
+    res = dict(res, error=error, completed=False)
+    res["acceptance"] = dict(res["acceptance"], completed=False, passed=False)
+    return res
+
+
 def markdown(results: list[dict]) -> str:
     out = ["# b2b-relay Integrationstest (Scheibe 2a)", ""]
     out += ["| Profil | Übergaben | Sprung max (ms) | Sprung Mittel (ms) | Lücken | max Lücke (ms) | xruns | Puffer min/max (s) "
             "| Rate min/max | Drift max (ms) | Ergebnis |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         s = r["summary"]
+        if not s:
+            out.append(f"| {r['profile']} | – | – | – | – | – | – | – | – | – | abgebrochen |")
+            continue
         out.append(f"| {r['profile']} | {r['handovers_effective']} | {s['phase_jump_max_abs_ms']} | "
                    f"{s['phase_jump_mean_abs_ms']} | {s['gaps_total']} | {s['max_gap_ms']} | {s['xruns']} | "
                    f"{s['buffer_min_s']}/{s['buffer_max_s']} | {s['rate_min']}/{s['rate_max']} | "
                    f"{s['drift_max_abs_ms']} | {'bestanden' if r['acceptance']['passed'] else 'NICHT bestanden'} |")
     for r in results:
-        out += ["", f"## {r['profile']}", "", "| # | von → nach | Umschaltpunkt (s) | Phasensprung (ms) | Lücken | "
+        out += ["", f"## {r['profile']}", ""]
+        if r.get("error"):
+            out += [f"**Abgebrochen:** {r['error']} (Container-Logs: `{r['profile']}/logs/`, `compose.log`)", ""]
+        out += ["| # | von → nach | Umschaltpunkt (s) | Phasensprung (ms) | Lücken | "
                 "max Sprung-Verhältnis |", "|---|---|---|---|---|---|"]
         for p in r["per_handover"]:
             out.append(f"| {p['n']} | {p['from']} → {p['to']} | {p['switch_s']} | {p['phase_jump_ms']} | "
