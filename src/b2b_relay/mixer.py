@@ -299,6 +299,10 @@ class RelayMixer:
         """Lag der Quelle in Samples (Schätzung, mit Drift fortgeschrieben)."""
         return self._get(name).tracker.predict(self._wall if wall is None else wall)
 
+    def lag_params(self, name: str) -> tuple[float, float, float]:
+        """(lag in Samples bei t_ref, Drift in Samples je Sample, t_ref als Wanduhr)."""
+        return self._lag_params(self._get(name))
+
     def source_info(self, name: str) -> SourceInfo:
         s = self._get(name)
         tr = s.tracker
