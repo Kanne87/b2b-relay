@@ -100,7 +100,7 @@ class SimDJ:
         ref_name = ho.src
         l0, rho, tref = mixer.lag_params(ref_name)
         w_arm = (ho.t_arm + l0 - rho * tref) / (1.0 - rho)
-        w_cut = (ho.t_h + l0 - rho * tref) / (1.0 - rho)
+        w_cut = (self.plan.echo_window(ho)[1] + l0 - rho * tref) / (1.0 - rho)
         st = Stint(w_arm, (l0, rho, tref), self.rtt, self.eps, w_cut)
         self.stints.append(st)
         return st
@@ -125,7 +125,7 @@ class SimDJ:
                 continue
             if win.zi is None:
                 win.zi = np.zeros(max(len(self._a), len(self._b)) - 1)
-            heard = mixer.read_program(a, b - a).astype(np.float64)
+            heard = mixer.read_program(a, b - a, source=win.ho.src).astype(np.float64)
             T = np.arange(a, b)
             lost = self.down_lost[T // PACKET]
             if lost.any():

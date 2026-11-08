@@ -139,6 +139,7 @@ class RelayMixer:
         self._segments: list[_Segment] = []
         self._wall = 0
         self._active: str | None = None
+        self._cur_seg: _Segment | None = None
         self._previous: str | None = None
         self._fallback = False
         self._silent_flag = False
@@ -168,7 +169,8 @@ class RelayMixer:
             raise RuntimeError("set_active ist nur für die erste Quelle; danach request_handoff")
         s.tracker.set_reference(0.0, float(self._wall))
         s.is_reference = True
-        self._segments.append(_Segment(self._wall, name, 1))
+        self._cur_seg = _Segment(self._wall, name, 1)
+        self._segments.append(self._cur_seg)
         self._active = name
         self._event("active_set", source=name)
 
@@ -274,10 +276,14 @@ class RelayMixer:
         self._prune()
         return out
 
-    def read_program(self, t0: int, n: int) -> np.ndarray:
+    def read_program(self, t0: int, n: int, source: str | None = None) -> np.ndarray:
         """Programm P(T) für T in [t0, t0+n) mit dem heutigen Stand (Rückkanal/Monitor).
-        Was noch nicht angekommen ist, kommt als Null."""
-        return self._compose(int(t0), int(n), count=False)
+
+        Mit ``source`` kommt statt des Programms der auf T ausgerichtete Feed genau dieser Quelle.
+        Der übernehmende DJ bekommt als Rückkanal den Feed der abgebenden Quelle, solange er
+        seinen Übergang mischt; das Programm selbst käme nach der Übergabe aus seinem eigenen
+        Feed (Rückkopplung). Was noch nicht angekommen ist, kommt als Null."""
+        return self._compose(int(t0), int(n), count=False, only=source)
 
     # ------------------------------------------------------------------ Auskunft
 
@@ -349,8 +355,9 @@ class RelayMixer:
         if s.silence_run >= self._rearm:
             # Quelle (wieder) angeschlossen → Messung frisch beginnen
             s.signal_start = w0 + int(loud[0])
-            if s.name != self._active and not s.is_reference:
+            if s.name != self._active:
                 s.tracker.reset()
+                s.is_reference = False
         s.silence_run = n - 1 - int(loud[-1])
         s.had_signal = True
         s.level_db = 20.0 * np.log10(float(np.sqrt(np.mean(np.square(blk, dtype=np.float64)))) + 1e-12)
@@ -381,9 +388,9 @@ class RelayMixer:
             weights[seg.src] = weights.get(seg.src, 0.0) * (1.0 - r) + r
         return weights
 
-    def _compose(self, t0: int, n: int, count: bool) -> np.ndarray:
+    def _compose(self, t0: int, n: int, count: bool, only: str | None = None) -> np.ndarray:
         out = np.zeros(n, dtype=np.float64)
-        weights = self._weights(t0, n)
+        weights = {self._get(only).name: 1.0} if only else self._weights(t0, n)
         if not weights:
             return out
         T = np.arange(t0, t0 + n, dtype=np.float64)
@@ -400,21 +407,26 @@ class RelayMixer:
         return out
 
     def _update_active(self) -> None:
+        """Die Umschaltung gilt, sobald der Live-Rand der bisher aktiven Quelle ihren Punkt passiert.
+        Es geht nur vorwärts in der Segmentliste."""
         if not self._segments or self._active is None:
             return
         for _ in range(8):
+            cur = next((i for i, g in enumerate(self._segments) if g is self._cur_seg), None)
+            if cur is None:
+                cur = next((i for i, g in enumerate(self._segments) if g.src == self._active), 0)
+                self._cur_seg = self._segments[cur]
+            if cur + 1 >= len(self._segments):
+                return
+            nxt = self._segments[cur + 1]
             t_raw = self._wall - self.lag_of(self._active)
-            cand = None
-            for seg in self._segments:
-                if seg.t_start <= t_raw:
-                    cand = seg
-            if cand is None or cand.src == self._active:
+            if nxt.t_start > t_raw:
                 return
             old = self._active
             self._sources[old].last_active_wall = self._wall
-            self._previous, self._active = old, cand.src
+            self._previous, self._active, self._cur_seg = old, nxt.src, nxt
             self._silent_flag = False
-            self._event("handoff_effective", source=cand.src, previous=old, t_switch=cand.t_start)
+            self._event("handoff_effective", source=nxt.src, previous=old, t_switch=nxt.t_start)
 
     def _prune(self) -> None:
         horizon = self._wall - self._D - int(self.cfg.ring_s * self.fs)
@@ -447,11 +459,17 @@ class RelayMixer:
         n_win = min(int(c.est_window_s * fs), w_end - s.signal_start)
         if n_win < int(c.est_min_window_s * fs):
             return
-        x = s.ring.read(w_end - n_win, n_win)
-        if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) < self._sil_thr:
-            return
         w0 = w_end - n_win
         t_c = w0 + n_win / 2.0
+        if s.tracker.locked and abs(s.tracker.rate) > 2e-6:
+            # Drift im Fenster herausrechnen: x(w) mit der bisher geschätzten Rate entzerren,
+            # sonst verschmiert der Korrelationspeak über rate·Fensterlänge
+            pos = w0 + np.arange(n_win) + s.tracker.rate * (np.arange(n_win) - n_win / 2.0)
+            x = s.ring.read_frac(pos).astype(np.float32)
+        else:
+            x = s.ring.read(w0, n_win)
+        if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) < self._sil_thr:
+            return
         act_lag = self.lag_of(self._active)
         if s.tracker.locked:
             pred = s.tracker.predict(t_c)

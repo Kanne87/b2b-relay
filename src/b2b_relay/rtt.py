@@ -86,7 +86,9 @@ class LagTracker:
 
     def __init__(self, *, alpha: float = 0.45, beta: float = 0.12, gate: float = 144.0,
                  rate_limit: float = 500e-6, min_conf: float = 0.5,
-                 reacquire_conf: float = 0.8) -> None:
+                 reacquire_conf: float = 0.8, fit_span: float = 20.0 * 48000,
+                 fit_min_span: float = 2.0 * 48000) -> None:
+        self.fit_span, self.fit_min_span = fit_span, fit_min_span
         self.alpha, self.beta, self.gate = alpha, beta, gate
         self.rate_limit, self.min_conf, self.reacquire_conf = rate_limit, min_conf, reacquire_conf
         self.reset()
@@ -100,11 +102,13 @@ class LagTracker:
         self.last_update = None      # Wanduhr der letzten angenommenen Messung
         self._cand: tuple[float, float] | None = None
         self._outliers: list[tuple[float, float]] = []
+        self._hist: list[tuple[float, float]] = []   # angenommene Messungen (t_c, delay)
         self.n_updates = 0
 
     def set_reference(self, lag: float, t: float = 0.0) -> None:
         """Lag per Definition setzen (erste Quelle, Programm-Referenz)."""
         self.lag, self.rate, self.t_ref = float(lag), 0.0, float(t)
+        self._hist.clear()
         self.locked = True
         self.confidence = 1.0
 
@@ -127,6 +131,7 @@ class LagTracker:
                 self.confidence, self.last_update = conf, t_c
                 self.n_updates += 1
                 self._cand = None
+                self._hist = [(t0, d0), (t_c, delay)]
                 return True
             self._cand = (t_c, delay)
             return False
@@ -141,6 +146,7 @@ class LagTracker:
             self.confidence, self.last_update = conf, t_c
             self._outliers.clear()
             self.n_updates += 1
+            self._refit(t_c, delay)
             return True
         # Ausreißer: nur nach drei untereinander stimmigen, sehr sicheren Messungen neu aufsetzen
         if conf >= self.reacquire_conf:
@@ -154,5 +160,24 @@ class LagTracker:
                 self.confidence, self.last_update = conf, t_c
                 self._outliers.clear()
                 self.n_updates += 1
+                self._hist = [(t0, d0), (t1, d1)]
                 return True
         return False
+
+    def _refit(self, t_c: float, delay: float) -> None:
+        """Geradenanpassung über die letzten Messungen (Glättung, genaue Driftrate)."""
+        self._hist.append((t_c, delay))
+        cut = t_c - self.fit_span
+        self._hist = [h for h in self._hist if h[0] >= cut]
+        if len(self._hist) < 4:
+            return
+        t = np.array([h[0] for h in self._hist])
+        d = np.array([h[1] for h in self._hist])
+        tm = t.mean()
+        if t.max() - t.min() < self.fit_min_span:
+            return
+        slope, icpt = np.polyfit(t - tm, d, 1)
+        slope = float(np.clip(slope, -self.rate_limit, self.rate_limit))
+        self.rate = slope
+        self.lag = float(icpt + slope * (t_c - tm))
+        self.t_ref = float(t_c)

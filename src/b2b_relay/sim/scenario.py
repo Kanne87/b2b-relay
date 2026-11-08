@@ -163,7 +163,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             "program_lag_before_ms": lx / fs * 1e3,
             "confidence": float(sn["info"].confidence),
             "drift_est_ppm": float(rho * 1e6),
-            "drift_true_ppm": float(djs[ho.dst].eps * 1e6),
+            "drift_true_ppm": float((djs[ho.dst].eps + xrho) * 1e6),
         })
         # --- Beat-Phase des Programms an der Übergabe
         old, new = ho.old, ho.track
@@ -196,6 +196,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             rep["beat_phase_error_max_abs_ms"] = float(np.max(np.abs(rel)))
         else:
             rep["beat_phase_error_ms"] = rep["beat_phase_error_max_abs_ms"] = None
+        rep["beat_kicks"] = {"before": pre, "after": post}
         rep["beat_offset_before_ms"] = pre_off if pre_v else None
         rep["beat_kicks_measured"] = {"before": len(pre_v), "after": len(post_v),
                                       "skipped_loss": sum(1 for r in pre + post if r.get("lost"))}
@@ -204,6 +205,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         new_k = kn[(kn > swap + 0.15 * fs) & (kn < swap + 4 * plan.bar)][:6]
         newr = errs(new_k, ref_new)
         new_v = [r["err_ms"] for r in newr if r["ok"]]
+        rep["beat_kicks"]["new_track"] = newr
         rep["dj_human_error_ms"] = new.human_s * 1e3
         if new_v:
             rep["new_track_phase_error_ms"] = float(np.median(new_v))

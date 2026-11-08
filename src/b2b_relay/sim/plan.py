@@ -15,7 +15,7 @@ import numpy as np
 from .synth import Track, bar_samples
 
 SWAP_S = 0.05        # Dauer des Bass-Swaps
-MUTE_AFTER_S = 2.0   # nach der Übergabe spielt der abgebende DJ noch kurz weiter
+MUTE_AFTER_S = 2.0   # der abgebende DJ spielt über Übergang + 2 s weiter (Rückkanal, Fallback)
 MUTE_RAMP_S = 0.2
 
 
@@ -43,10 +43,6 @@ class PTrack:
     track: Track | None = field(default=None, repr=False)
     nxt: "PTrack | None" = field(default=None, repr=False)
     mute_at: float | None = None  # Programmzeit, ab der der DJ ausblendet (nach Übergabe)
-
-    @property
-    def swap_at(self) -> float:
-        return self.start  # wird über Plan.bar gesetzt, s. swap_point()
 
 
 @dataclass
@@ -97,7 +93,7 @@ class Plan:
             t_h = cur.start + (N + 1 + cfg.arm_bars) * bar
             d = delta()
             new = PTrack(len(self.tracks), other, t_h + d * self.fs, "handoff", d, N, t_h)
-            cur.mute_at = t_h + MUTE_AFTER_S * self.fs
+            cur.mute_at = new.start + N * bar + MUTE_AFTER_S * self.fs   # erst nach dem Übergang
             self.handoffs.append(PHandoff(h, active, other, t_arm, t_h, new, cur))
             cur.nxt = new
             self.tracks.append(new)
