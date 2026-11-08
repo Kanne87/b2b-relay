@@ -30,32 +30,30 @@ import signals as sg      # noqa: E402
 FS = sg.FS
 
 
-class Dj:
-    def __init__(self, name: str, api: str, ctl: str) -> None:
-        import jack
-        self.name, self.api, self.ctl = name, api.rstrip("/"), ctl
-        self.c = jack.Client(f"dj_{name}", no_start_server=True)
-        assert self.c.samplerate == FS, self.c.samplerate
-        self.i = [self.c.inports.register(f"in_{k}") for k in (1, 2)]
-        self.o = [self.c.outports.register(f"out_{k}") for k in (1, 2)]
+class DjCore:
+    """Signal und Zustand eines Test-DJs ohne JACK und ohne HTTP (auch für die Simulation in
+    ``tests/test_itest_sim.py``). ``process`` ist der Audio-Callback, ``control`` der Steuertakt (0,2 s)."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
         self.kick = sg.kick(name)
         self.frames = 0                                  # globaler Frame-Zähler (Beginn des Callbacks)
         self.ring = np.zeros(10 * FS, np.float32)        # Mono-Mitschnitt des gehörten Feeds
         self.state = "idle"                              # idle | next | live | out
+        self.prev_state = "idle"
         self.g_feed = 1.0
         self.g_own = 0.0
         self.grid: float | None = None                   # Rasterphase der eigenen Kicks (Frames mod Beat)
         self.last_t = -1e18                              # Zeit (Frames) des zuletzt gespielten Kicks
         self.lock = sg.PhaseLock()
-        self.demoted_since = None
+        self.demoted_since: float | None = None
+        self.now = 0.0                                   # Uhr des Steuertakts (Sekunden)
         self.pending = np.zeros(len(self.kick) + 4096, np.float32)   # Ausklang laufender Kicks
-        self.stop = threading.Event()
-        self.c.set_process_callback(self._process)
 
     # ---- Echtzeit
-    def _process(self, n: int) -> None:
+    def process(self, l_in: np.ndarray, r_in: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        n = len(l_in)
         f0 = self.frames
-        l_in, r_in = self.i[0].get_array(), self.i[1].get_array()
         x = (l_in + r_in) * 0.5
         w = f0 % len(self.ring)
         first = min(n, len(self.ring) - w)
@@ -65,7 +63,7 @@ class Dj:
         step = n / (2 * FS)                                  # Rampen: 0 → 1 in 2 s
         g_target = 0.0 if self.state == "live" else 1.0
         self.g_feed += float(np.clip(g_target - self.g_feed, -step, step))
-        out_hold = self.state == "out" and (time.monotonic() - (self.demoted_since or 0)) < 3.0
+        out_hold = self.state == "out" and (self.now - (self.demoted_since or 0)) < 3.0
         own_target = 1.0 if (self.state in ("live", "next") or out_hold) and self.grid is not None else 0.0
         self.g_own += float(np.clip(own_target - self.g_own, -step, step))
         tone = np.zeros(n, np.float32)
@@ -87,9 +85,60 @@ class Dj:
         self.pending[-n:] = 0.0
         pd = sg.pad(self.name, f0, n) * (1.0 if self.g_own > 0.0 else 0.0)
         mixed = tone * self.g_own + pd
-        self.o[0].get_array()[:] = l_in * self.g_feed + mixed
-        self.o[1].get_array()[:] = r_in * self.g_feed + mixed
         self.frames = f0 + n
+        return l_in * self.g_feed + mixed, r_in * self.g_feed + mixed
+
+    # ---- Steuerung
+    def _grid_from_feed(self) -> None:
+        end = self.frames
+        n = 8 * FS
+        if end < n:
+            return
+        x = self.ring[np.arange(end - n, end) % len(self.ring)]
+        ons = sg.detect_onsets(x) + (end - n)
+        if self.lock.update(ons):
+            self.grid = self.lock.phase
+
+    def control(self, live: str | None, nxt: str, now: float) -> str | None:
+        """Ein Steuertakt: ``live`` laut Server, ``nxt`` aus ``/ctl/next``. Liefert die Zustandsänderung
+        als Text (für das Log) oder None."""
+        self.now = now
+        if live == self.name:
+            if self.state != "live" and self.grid is None:
+                self.grid = float(self.frames % sg.BEAT)        # erster Live-DJ: eigenes Raster
+            self.state = "live"
+        elif self.state == "live":
+            self.state, self.demoted_since = "out", now
+        elif self.state == "out" and now - (self.demoted_since or 0) > 3.0:
+            self.state = "next" if nxt == self.name else "idle"
+        elif self.state != "out":
+            self.state = "next" if nxt == self.name else "idle"
+        if self.state in ("next", "idle"):
+            self._grid_from_feed()
+        if self.state != self.prev_state:
+            msg = f"dj {self.name}: {self.prev_state} -> {self.state}"
+            self.prev_state = self.state
+            return msg
+        return None
+
+
+class Dj:
+    def __init__(self, name: str, api: str, ctl: str) -> None:
+        import jack
+        self.name, self.api, self.ctl = name, api.rstrip("/"), ctl
+        self.c = jack.Client(f"dj_{name}", no_start_server=True)
+        assert self.c.samplerate == FS, self.c.samplerate
+        self.i = [self.c.inports.register(f"in_{k}") for k in (1, 2)]
+        self.o = [self.c.outports.register(f"out_{k}") for k in (1, 2)]
+        self.core = DjCore(name)
+        self.stop = threading.Event()
+        self.c.set_process_callback(self._process)
+
+    # ---- Echtzeit
+    def _process(self, n: int) -> None:
+        lo, ro = self.core.process(self.i[0].get_array(), self.i[1].get_array())
+        self.o[0].get_array()[:] = lo
+        self.o[1].get_array()[:] = ro
 
     # ---- Steuerung
     def _status(self) -> dict | None:
@@ -105,37 +154,12 @@ class Dj:
         except OSError:
             return ""
 
-    def _grid_from_feed(self) -> None:
-        end = self.frames
-        n = 8 * FS
-        if end < n:
-            return
-        x = self.ring[np.arange(end - n, end) % len(self.ring)]
-        ons = sg.detect_onsets(x) + (end - n)
-        if self.lock.update(ons):
-            self.grid = self.lock.phase
-
     def loop(self) -> None:
-        prev = "idle"
         while not self.stop.wait(0.2):
             st = self._status()
-            live = st.get("live") if st else None
-            nxt = self._next_name()
-            if live == self.name:
-                if self.state != "live" and self.grid is None:
-                    self.grid = float(self.frames % sg.BEAT)        # erster Live-DJ: eigenes Raster
-                self.state = "live"
-            elif self.state == "live":
-                self.state, self.demoted_since = "out", time.monotonic()
-            elif self.state == "out" and time.monotonic() - (self.demoted_since or 0) > 3.0:
-                self.state = "next" if nxt == self.name else "idle"
-            elif self.state != "out":
-                self.state = "next" if nxt == self.name else "idle"
-            if self.state in ("next", "idle"):
-                self._grid_from_feed()
-            if self.state != prev:
-                print(f"dj {self.name}: {prev} -> {self.state}", flush=True)
-                prev = self.state
+            msg = self.core.control(st.get("live") if st else None, self._next_name(), time.monotonic())
+            if msg:
+                print(msg, flush=True)
 
     def run(self) -> None:
         self.c.activate()

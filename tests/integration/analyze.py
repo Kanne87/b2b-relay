@@ -74,9 +74,13 @@ def _onsets_tc(mid: np.ndarray, tm: TimeMap, lo: int, hi: int) -> np.ndarray:
     return tm.to_t(ons)
 
 
-def phase_jump(mid: np.ndarray, tm: TimeMap, i_sw: int) -> dict:
-    before = _onsets_tc(mid, tm, i_sw - 24 * FS, i_sw - 2 * FS)
-    after = _onsets_tc(mid, tm, i_sw + 8 * FS, i_sw + 26 * FS)
+WINDOWS = ((-24.0, -2.0), (8.0, 26.0))     # Fenster vor/nach dem Umschaltpunkt (s) für den Phasensprung
+
+
+def phase_jump(mid: np.ndarray, tm: TimeMap, i_sw: int, windows=WINDOWS) -> dict:
+    (b0, b1), (a0, a1) = windows
+    before = _onsets_tc(mid, tm, i_sw + int(b0 * FS), i_sw + int(b1 * FS))
+    after = _onsets_tc(mid, tm, i_sw + int(a0 * FS), i_sw + int(a1 * FS))
     out = {"n_before": int(len(before)), "n_after": int(len(after)), "jump_ms": None}
     if len(before) < 8 or len(after) < 8:
         out["note"] = "zu wenige Kicks in einem Fenster"
@@ -88,7 +92,7 @@ def phase_jump(mid: np.ndarray, tm: TimeMap, i_sw: int) -> dict:
 
 
 def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = None,
-                    handovers: list[dict] | None = None) -> dict:
+                    handovers: list[dict] | None = None, windows=WINDOWS) -> dict:
     fs, stereo = read_wav(wav)
     assert fs == FS, fs
     mid = ((stereo[:, 0] + stereo[:, 1]) * 0.5).astype(np.float32)
@@ -97,17 +101,20 @@ def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = Non
     eff = [e for e in ev if e["kind"] == "handoff_effective"]
     falls = [e for e in ev if e["kind"] == "fallback"]
     refused = [e for e in ev if e["kind"] == "handoff_refused"]
+    sched = [e for e in ev if e["kind"] == "handoff_scheduled"]
     per = []
     for n, e in enumerate(eff, 1):
         i_sw = int(tm.to_idx(e["Tc_switch"]))
-        pj = phase_jump(mid, tm, i_sw)
+        pj = phase_jump(mid, tm, i_sw, windows)
+        lag = next((x.get("lag_s") for x in sched if x.get("t_switch") == e.get("t_switch")
+                    and x.get("target") == e.get("source")), None)
         w = mid[max(i_sw - FS, 0):i_sw + 3 * FS]
         gaps = find_gaps_chunked(w, FS, 5.0)
         j_win = max_sample_jump(mid[max(i_sw - int(0.15 * FS), 0):i_sw + int(0.35 * FS)])
         j_base = max_sample_jump(mid[max(i_sw - 3 * FS, 0):i_sw - 2 * FS]) or 1e-9
         per.append({"n": n, "to": e.get("source"), "from": e.get("previous"), "switch_s": round(i_sw / FS, 2),
                     "phase_jump_ms": None if pj["jump_ms"] is None else round(pj["jump_ms"], 3),
-                    "phase_detail": pj,
+                    "phase_detail": pj, "lag_s": lag,
                     "gaps": len(gaps), "max_gap_ms": round(max((g[1] for g in gaps), default=0) / FS * 1e3, 2),
                     "max_jump_ratio": round(j_win / j_base, 2)})
     gaps_all = find_gaps_chunked(mid[int(8 * FS):], FS, 5.0)
