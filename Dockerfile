@@ -37,18 +37,19 @@ COPY src ./src
 RUN pip install --no-cache-dir ".[live]"
 COPY docker/entrypoint.sh /usr/local/bin/b2b-entrypoint
 RUN useradd --system --create-home --uid 10001 b2b && chmod +x /usr/local/bin/b2b-entrypoint
-USER b2b
+USER 10001
 ENV B2B_API_PORT=8090 \
     JACK_RATE=48000 \
     JACK_PERIOD=256
 # TCP 4464: JackTrip-Hub-Handshake; UDP 61002-62000: Hub-Worker (je Client ein Port); TCP 8090: HTTP-API
 EXPOSE 4464/tcp 8090/tcp 61002-62000/udp
 HEALTHCHECK --interval=15s --timeout=4s --start-period=20s --retries=3 \
-  CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/healthz'%os.environ.get('B2B_API_PORT','8090'),timeout=3)" || exit 1
+  CMD ["python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/healthz'%os.environ.get('B2B_API_PORT','8090'),timeout=3)"]
 ENTRYPOINT ["/usr/local/bin/b2b-entrypoint"]
 
 FROM runtime AS testclient
-USER root
+# hadolint ignore=DL3002
+USER 0
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY tests/integration/client.py tests/integration/signals.py /opt/itest/

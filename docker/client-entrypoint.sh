@@ -17,6 +17,7 @@ for _ in $(seq 1 50); do jack_lsp >/dev/null 2>&1 && break; sleep 0.3; done
 
 if [ -n "${NETEM:-}" ]; then
   IFACE="$(ip -o -4 route show to default | awk '{print $5}' | head -n1)"
+  # shellcheck disable=SC2086  # NETEM besteht aus mehreren Wörtern
   tc qdisc replace dev "${IFACE}" root netem ${NETEM}
   echo "netem auf ${IFACE}: ${NETEM}"
   tc qdisc show dev "${IFACE}"
