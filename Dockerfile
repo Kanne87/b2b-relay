@@ -12,7 +12,7 @@ ARG JACKTRIP_VERSION=v2.7.2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates git meson ninja-build pkg-config \
-      qt6-base-dev qmake6 libjack-jackd2-dev \
+      qt6-base-dev qmake6 libjack-jackd2-dev python3-yaml python3-jinja2 \
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --depth 1 --branch "${JACKTRIP_VERSION}" https://github.com/jacktrip/jacktrip.git /src/jacktrip
 WORKDIR /src/jacktrip
