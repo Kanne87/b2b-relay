@@ -64,6 +64,8 @@ class RelayConfig:
     silence_timeout_s: float = 0.25     # Stille der aktiven Quelle, ab der der Fallback greift
     rearm_silence_s: float = 1.0        # Stille, nach der eine Quelle als "neu angeschlossen" gilt
     max_stale_s: float = 8.0            # ältere Schätzung → Übergabe verweigert
+    reacquire_delay_s: float = 3.0      # nach einem Wechsel der aktiven Quelle: Messfenster der übrigen erst
+                                        # ab hier (Rückkanal umgeschaltet, neuer Feed angekommen, Ausklang vorbei)
     ring_s: float | None = None
 
     def __post_init__(self) -> None:
@@ -194,6 +196,7 @@ class _Source:
         self.level_db = -120.0
         self.last_active_wall: int | None = None
         self.is_reference = False
+        self.est_from: int | None = None   # Wanduhr, ab der das Messfenster beginnen darf (Neu-Einrasten)
 
 
 class RelayMixer:
@@ -291,7 +294,7 @@ class RelayMixer:
             return no("already_active", f"{target!r} ist schon aktiv oder bereits vorgemerkt")
         act_lag = self.lag_of(self._active) if self._active else 0.0
         # Lag des Ziels relativ zur Zeitachse: Schätzung, sonst Programmquelle + RTT-Hinweis
-        if s.tracker.locked:
+        if s.tracker.usable:
             lag_s = s.tracker.predict(self._wall) / self.fs
             src = "Schätzung"
         elif s.rtt_hint_s is not None:
@@ -320,6 +323,9 @@ class RelayMixer:
                       lag_s=lag_s, required_s=lag_s + c.reserve_s)
         if not s.tracker.locked:
             return no("not_locked", f"Für {target!r} gibt es noch keine sichere RTT-Schätzung",
+                      lag_s=lag_s)
+        if s.tracker.reacquiring:
+            return no("not_locked", f"Rückkanal von {target!r} hat gewechselt, die RTT wird neu eingemessen",
                       lag_s=lag_s)
         stale = None if s.tracker.last_update is None else (self._wall - s.tracker.last_update) / self.fs
         if stale is not None and stale > c.max_stale_s and not s.is_reference:
@@ -538,7 +544,7 @@ class RelayMixer:
         return (self._wall - lag_s * self.fs - self.output_position) / self.fs
 
     def _expected_lag_s(self, s: _Source) -> float | None:
-        if s.tracker.locked:
+        if s.tracker.usable:
             return s.tracker.predict(self._wall) / self.fs
         if s.rtt_hint_s is not None:
             return (self.lag_of(self._active) if self._active else 0.0) / self.fs + s.rtt_hint_s
@@ -585,12 +591,12 @@ class RelayMixer:
         tr = s.tracker
         ref = self._active if (self._active and self._active != name) else self._previous
         rtt = None
-        if tr.locked and ref is not None and ref != name:
+        if tr.usable and ref is not None and ref != name:
             rtt = (tr.predict(self._wall) - self.lag_of(ref)) / self.fs
         return SourceInfo(
-            name=name, locked=tr.locked,
-            lag_s=tr.predict(self._wall) / self.fs if tr.locked else None,
-            rtt_s=rtt, drift_ppm=tr.rate * 1e6 if tr.locked else None,
+            name=name, locked=tr.usable,
+            lag_s=tr.predict(self._wall) / self.fs if tr.usable else None,
+            rtt_s=rtt, drift_ppm=tr.rate * 1e6 if tr.usable else None,
             confidence=tr.confidence, level_db=s.level_db,
             silent=s.silence_run >= self._sil_timeout,
             stale_s=None if tr.last_update is None else (self._wall - tr.last_update) / self.fs)
@@ -698,7 +704,33 @@ class RelayMixer:
             self._sources[old].last_active_wall = self._wall
             self._previous, self._active, self._cur_seg = old, nxt.src, nxt
             self._silent_flag = False
+            self._reacquire_waiting()
             self._event("handoff_effective", source=nxt.src, previous=old, t_switch=nxt.t_start)
+
+    def _reacquire_waiting(self) -> None:
+        """Jede wartende Quelle hört den Feed der aktiven (Rückkanal); wechselt die aktive Quelle, springt
+        ihr Lag um den Lag-Unterschied der beiden aktiven Quellen. Die Nachführung sucht nur ±gate um die
+        Vorhersage und fände den neuen Lag nie (S3788) - also alle wartenden Quellen neu einrasten, die
+        bisherige Referenzquelle eingeschlossen."""
+        start = self._wall + int(self.cfg.reacquire_delay_s * self.fs)
+        for s in self._sources.values():
+            if s.name == self._active:
+                s.tracker.reacquiring = False   # Rückfall auf eine Quelle im Neu-Einrasten: ihr Lag bleibt
+                s.est_from = None
+                continue
+            s.is_reference = False
+            s.tracker.begin_reacquire()
+            s.est_from = start
+
+    def _still_rendered(self, name: str) -> bool:
+        """Liest die Ausgabe noch ein Segment dieser Quelle (Übergang im Puffer)? Dann darf ihr Lag
+        nicht springen."""
+        t_out = self.output_time
+        segs = self._segments
+        for j, g in enumerate(segs):
+            if g.src == name and (j + 1 >= len(segs) or segs[j + 1].t_start + segs[j + 1].fade > t_out):
+                return True
+        return False
 
     def _prune(self) -> None:
         horizon = self._t_blk - int(self.cfg.ring_s * self.fs)
@@ -722,13 +754,18 @@ class RelayMixer:
                 continue
             if self._segments[-1].src == s.name:
                 continue    # Übergabe an s ist vorgemerkt oder läuft: Schätzung eingefroren
+            if s.est_from is not None and self._wall - s.est_from < int(c.est_min_window_s * self.fs):
+                continue
+            if s.tracker.reacquiring and self._still_rendered(s.name):
+                continue
             self._estimate(s)
 
     def _estimate(self, s: _Source) -> None:
         c = self.cfg
         fs = self.fs
         w_end = self._wall
-        n_win = min(int(c.est_window_s * fs), w_end - s.signal_start)
+        start = s.signal_start if s.est_from is None else max(s.signal_start, s.est_from)
+        n_win = min(int(c.est_window_s * fs), w_end - start)
         if n_win < int(c.est_min_window_s * fs):
             return
         w0 = w_end - n_win
@@ -743,7 +780,7 @@ class RelayMixer:
         if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) < self._sil_thr:
             return
         act_lag = self.lag_of(self._active)
-        if s.tracker.locked:
+        if s.tracker.locked and not s.tracker.reacquiring:
             pred = s.tracker.predict(t_c)
             lo = int(np.floor(pred - s.tracker.gate))
             hi = int(np.ceil(pred + s.tracker.gate))
@@ -761,8 +798,7 @@ class RelayMixer:
             return
         d = lo + m.delay    # gcc_phat misst relativ zur unteren Suchgrenze lo
         if d <= lo + 1.5 or d >= hi - 1.5:
-            if not s.tracker.locked:
-                return
+            return          # Maximum am Rand: der wahre Peak liegt außerhalb des Suchbereichs
         s.tracker.update(t_c, d, m.confidence)
 
     # -- Fallback
