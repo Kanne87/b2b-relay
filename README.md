@@ -19,8 +19,9 @@ Der Server sieht nur Audio. BPM, Downbeat und Taktposition kommen aus Beat-Erken
 ## Scheiben
 
 1. Kern: Relay-Mixer-Algorithmus (Zeitachse, RTT-Messung, Ausrichtung, Umschaltung) mit deterministischer Offline-Simulation.
-   1b. **Elastischer Ausgang** (Puffer-Regelung per Varispeed, siehe unten). **← dieser Stand**
+   1b. **Elastischer Ausgang** (Puffer-Regelung per Varispeed, siehe unten).
 2. Live-Audio: Transport (JackTrip-Hub/JACK) auf dem Server, Test mit künstlicher Netzverzögerung (tc netem).
+   2a. **Live-Server** (JACK-Client hinter JackTrip-Hub, Docker, CI, Integrationstest). **← dieser Stand** (Betrieb: Abschnitt „Betrieb“)
 3. Beat-Analyse + WebSocket + Weboberfläche (BPM, Takt/Phrase latenzkorrigiert, Live-Anzeige, Übergabe-Knopf, Leitungsqualität).
 4. Video/OBS, Overlay, Ausspielung Twitch (DJ Program).
 
@@ -323,3 +324,162 @@ gespielt hat (Ankunft beim Server − RTT/2, aus der wahren Lag-Funktion des Sim
   je Übergabe) summieren sich deshalb über die Kette (Simulation: `grid_offset_ms` bis 118 ms nach 30 Übergaben,
   im Mittel ≈ 60 ppm Tempoabweichung der Achse). Zwischen den Quellen verschiebt das nichts (RTT-Fehler und
   Beat-Phase bleiben klein), das Programm läuft aber mit leicht falscher Taktrate. Vorschlag in der PR-Beschreibung.
+
+---
+
+# Scheibe 2a: Live-Server (Betrieb)
+
+Der `RelayMixer` läuft als JACK-Client `b2b-relay` hinter einem JackTrip-Hub-Server. Alles in einem Container:
+`jackd` (Dummy-Treiber, 48 kHz, Periode 256) → `jacktrip -S -p 5` (Hub-Server, **ohne Auto-Patching**) → `python -m b2b_relay.live`.
+
+```
+DJ-Rechner --jacktrip--> [Hub-Worker "alice": alice:receive_N] --JACK--> b2b-relay:in_alice_L/R
+                                                                              | Ring (lock-frei, kein Alloc)
+                                                                              v
+                                              Worker-Thread: RelayMixer (Mitte) + Folger (Seite), RTT-Schätzung, Drift
+                                                                              | Ring
+                                                                              v
+                                   b2b-relay:program_L/R --JACK--> Hörer-Clients (<name>:send_N), optional WAV
+Rückkanal (ohne Python):  <live>:receive_N --JACK--> <wartender DJ>:send_N   (direkte Portverbindung)
+```
+
+## Start
+
+```bash
+docker compose up -d                       # Image ghcr.io/kanne87/b2b-relay:latest, network_mode: host
+curl -s localhost:8090/status | jq .       # Vorgabe: API nur auf 127.0.0.1
+```
+
+`docker compose build` baut lokal: JackTrip v2.7.2 aus dem Quelltext **ohne GUI** (`-Dnogui=true -Dnovs=true`),
+Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[live]`, `jackd -d dummy -r 48000 -p 256`,
+`jacktrip -S -p 5 -q auto`, `python -m b2b_relay.live`.
+
+## Ports (network_mode: host, kein NAT-Mapping)
+
+| Port | Protokoll | Zweck |
+|---|---|---|
+| 4464 | TCP | JackTrip-Hub-Handshake (Clients verbinden sich hierhin) |
+| 61002 – 62000 | UDP | Audio der Hub-Worker, je verbundenem Client ein Port ab `JACKTRIP_UDP_BASE` (bei 3–5 DJs 61002–61006) |
+| 8090 | TCP | HTTP-API (`B2B_API_PORT`), Vorgabe nur `127.0.0.1` |
+
+## Umgebung
+
+| Variable | Vorgabe | Bedeutung |
+|---|---|---|
+| `JACK_RATE` / `JACK_PERIOD` | 48000 / 256 | Samplerate und Periode des Dummy-Treibers (Samplerate fest 48 kHz) |
+| `JACK_REALTIME` | 0 | 1 = `jackd -R` (braucht `cap_add: SYS_NICE`, `ulimits: rtprio 95, memlock -1`) |
+| `JACKTRIP_HUBPATCH` | 5 | Patch-Modus des Hubs; 5 = kein Auto-Patching (nicht ändern) |
+| `JACKTRIP_QUEUE` / `JACKTRIP_UDP_BASE` / `JACKTRIP_EXTRA` | auto / 61002 / – | Queue des Servers, UDP-Basisport, weitere Schalter |
+| `B2B_API_HOST` / `B2B_API_PORT` | 127.0.0.1 / 8090 | Bindung der API. Für Zugriff von außen `0.0.0.0` **und** `B2B_API_TOKEN` setzen |
+| `B2B_API_TOKEN` | leer | Bearer-Token; leer = keine Prüfung |
+| `B2B_CHUNK` | 2048 | Frames je Worker-Block (Vielfaches von 64) |
+| `B2B_TARGET_BUFFER_S` / `B2B_MIN_BUFFER_S` / `B2B_MAX_DEV` | 3.0 / 1.0 / 0.005 | Regelung des elastischen Ausgangs (Scheibe 1b) |
+| `B2B_DEFAULT_ROLE` / `B2B_ROLES` | dj / – | Rolle neuer Clients; `B2B_ROLES="tv=listener,kai=dj"` legt Rollen nach Name fest |
+| `B2B_AUTO_ACTIVE` | true | Der erste verbundene DJ ist live (sonst setzt `POST /handover` den ersten) |
+| `B2B_RECORD_DIR` / `B2B_RECORD_FORMAT` | – / pcm16 | Mitschnitt der Programmausgabe als WAV (`pcm16` oder `float32`), daneben `*.trace.jsonl` |
+| `B2B_DRIFT_ENABLE` / `B2B_DRIFT_DEADBAND_MS` / `B2B_DRIFT_SLEW_MS_PER_S` | true / 1 / 1 | Verankerung der Zeitachse an der Wanduhr |
+| `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
+
+## Client-Aufruf für DJs
+
+```bash
+jacktrip -C <host> --remotename <name> -n 2 -q auto
+```
+
+Der Name ist die Identität im Status, in `/roles` und `/handover`. Linux mit JACK: wie oben, Audio in/aus
+`JackTrip:send_*` / `JackTrip:receive_*`. **macOS/Windows ohne JACK** nutzen das RtAudio-Backend (in den
+JackTrip-Paketen enthalten): `jacktrip -R -C <host> --remotename <name> -n 2 -q auto` (Gerät wählen mit
+`--audiodevice`, Liste mit `--listdevices`). Feste Samplerate 48 kHz.
+
+## Routing und Rollen
+
+* Jeder Client mit `receive_N`-Ports erscheint im Status. Rolle **dj**: sein Audio geht in den Mixer. Rolle
+  **listener**: er bekommt `program_L/R` zurück und liefert nichts.
+* **Rückkanal:** Jeder DJ, der nicht live ist, bekommt den Roh-Feed der live spielenden Quelle über eine direkte
+  JACK-Verbindung (`<live>:receive_N → <dj>:send_N`). Bei jeder Übergabe (Wechsel von `live`) schaltet der Router
+  um (Zeitraster `B2B_ROUTER_INTERVAL_S`, 0,5 s). Der Live-DJ hört nichts zurück. Kein Python, kein zusätzlicher Puffer.
+* Der Mixer ist einkanalig; Stereo läuft als Mitte (RTT-Messung, Entscheidungen) und Seite (Folger mit denselben Lags
+  und Umschaltpunkten), Ausgabe `L = M+S`, `R = M−S`.
+
+## HTTP-API (FastAPI, keine Oberfläche)
+
+```bash
+curl -s localhost:8090/status
+curl -s -XPOST localhost:8090/handover -H 'content-type: application/json' -d '{"to":"bob"}'
+curl -s -XPOST localhost:8090/roles    -H 'content-type: application/json' -d '{"client":"tv","role":"listener"}'
+```
+
+* `GET /status`: `live`, `previous`, `buffer` (Puffer B, Rate, äquivalente BPM, Freigabe/Wartezeit der Übergabe je Ziel),
+  `sources` (je Quelle `rtt_ms`, `jitter_ms` = Streuung der Lag-Messungen, `drift_ppm`, Konfidenz, Pegel), `drift`,
+  `jack` (`xruns`, `out_underruns`, `cb_errors`, `cpu_load`), `worker` (Rechenlast, verworfene Frames), `clients`
+  (Name, Rolle, `live`, was der Client hört), `events`, `recording`. `GET /healthz` für Healthchecks.
+* `POST /handover {"to": name}`: 200 bei Annahme; 409 mit `reason`/`message`/`wait_s` bei Verweigerung
+  (z. B. `buffer_too_low`, `not_locked`), 404 bei unbekanntem Namen. Ohne aktive Quelle setzt es die erste.
+* `POST /roles {"client", "role": "dj"|"listener"}`: der live spielende DJ kann nicht Hörer werden (409).
+
+## Zeitachse und Wanduhr (Drift)
+
+Die Programmzeitachse T wird an `CLOCK_MONOTONIC` verankert (`live/drift.py`). Gemessen wird die Abweichung des Live-Rands
+von der Sollkurve `T_ref + Δt_wall − Σ Lag-Zuwachs der Übergaben` (Achsendrift aus Grenze 1b plus Lauf der JACK-Uhr gegen
+die Wanduhr). Der Rest wird als **Umlabeln** der Achse ausgeregelt (`RelayMixer.retime`, ≤ 1 ms/s, Totband 1 ms): das
+ändert kein Audio und keine Phase zwischen den Quellen. Die Varispeed-Stufe regelt weiter den Puffer B (sie kann
+die Lage der Achse nicht verändern, nur die Ausgabeposition gegen den Live-Rand); die Wahl „Umlabeln statt Tempo“
+ist im PR begründet. Im Status unter `drift`: `drift_ms` (Regelgröße, Ziel < 10 ms), `raw_drift_ms` (ohne Eingriff),
+`corrected_ms`, `ppm_60s`, `max_abs_ms`. Alle Lags tragen einen Vorlauf von `B2B_DRIFT_BASE_S` (10 s), damit sie
+positiv bleiben; im Status stehen nur RTTs (relative Lags).
+
+## Callback und xruns
+
+Der JACK-Callback kopiert nur zwischen Port-Puffern und `AudioRing` (lock-frei, ein Schreiber/ein Leser, Zähler statt
+Lock, vorab angelegter Speicher; `tests/test_live_ring.py` misst per `tracemalloc`, dass kein Datenpuffer entsteht) und
+fängt jede Ausnahme (`cb_errors`). `RelayMixer.process` und die RTT-Schätzung laufen im Worker-Thread mit Blöcken
+von 2048 Frames; der Programmausgang hat ohnehin 3 s Puffer. Der Callback ist Python und braucht das GIL
+(`sys.setswitchinterval(0.0005)`); xruns zählt der JACK-Callback (`jack.xruns`). Kein Echtzeit-Scheduling im Container
+voreingestellt (`JACK_REALTIME`).
+
+## Integrationstest (Docker, tc netem)
+
+```bash
+python tests/integration/run.py --dry-run                    # Ablauf anzeigen, startet nichts
+python tests/integration/run.py                              # 3 Profile x 10 Übergaben, ca. 40 min + Image-Bau
+python tests/integration/run.py --profiles clean --handovers 3 --hold-s 45 --out /tmp/itest
+```
+
+`docker-compose.yml` in `tests/integration/`: Server + 3 Test-DJs (`client.py`: eigenes `jackd` dummy, `jacktrip`-Client,
+Kicks bei 174 BPM mit je eigener Klangfarbe plus leises Pad; der Übernehmende rastet auf das Raster des gehörten Feeds ein,
+reicht den Feed durch und mischt seine Kicks phasenrichtig dazu, wie in `sim/`). `tc netem` läuft im Client-Container
+(`cap_add: NET_ADMIN`) auf dessen Upload; der Server bleibt unverändert. Profile:
+
+| Profil | netem (Client-Egress) |
+|---|---|
+| `clean` | keine |
+| `wan40` | `delay 40ms 5ms distribution normal` |
+| `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50%` |
+
+Ausgabe in `--out`: `report.md`, `results.json` und je Profil `rec/program-*.wav` (Mitschnitt der Programmausgabe),
+`rec/*.trace.jsonl` (Block-Zeilen: Mitschnitt-Index, Inhaltszeit, Rate, Puffer, Drift, xruns; Ereignisse), `status.jsonl`,
+`analysis.json`. Gemessen werden je Übergabe der Beat-Phasenfehler (Raster 22 s vor gegen 18 s nach dem Umschaltpunkt,
+in Inhaltszeit, also unabhängig vom Varispeed), Lücken, Sprung-Verhältnis (Klicks) sowie xruns und Puffer-/Raten-Verlauf.
+Grenzen für die Abnahme: `tests/integration/analyze.py` (`LIMITS`). In GitHub Actions läuft der Test im Job
+`integration`, der Bericht ist Artifact und Job-Zusammenfassung.
+
+## CI
+
+`.github/workflows/ci.yml`: `unit` (pytest), `image` (baut; Push von `:latest` und `:<sha>` nach `ghcr.io/kanne87/b2b-relay`
+nur bei Push auf `main`), `integration` (Docker + netem auf dem Runner, derzeit `continue-on-error`, bis der erste
+grüne Lauf vorliegt).
+
+## Lizenz
+
+JackTrip-Kern: MIT (Expat). Die grafische Oberfläche („Classic mode“, aus QJackTrip) steht unter GPL-3. Der Dockerfile
+baut JackTrip ausschließlich als Kommandozeilenprogramm (`-Dnogui=true -Dnovs=true`), es wird kein GUI-Code
+übernommen oder ausgeliefert. Wer ein Binär-Paket von jacktrip.org für DJ-Rechner verteilt, verteilt dort das GUI mit.
+
+## Grenzen (Scheibe 2a)
+
+* Keine Authentifizierung der JackTrip-Verbindung (der Hub nimmt jeden Client an); die API ist nur per Token geschützt.
+* Der Mixer rechnet mono (Mitte/Seite); ein Quellsignal in reiner Gegenphase wird nicht gemessen.
+* Der Docker-Build und der Integrationstest sind in der Entwicklungsumgebung nicht ausgeführt worden (kein Docker); die
+  Live-Pfade sind mit einem JACK-Ersatz (`tests/fakejack.py`) getestet, nicht gegen echtes `jackd`/`jacktrip`.
+* Die Netzstörung wirkt nur auf den Upload der Clients.
+* Nicht Teil: Beat-Analyse, Weboberfläche, Phasemeter (Scheibe 3), Video (4), Begleit-App/Installer (5), Deploy.

@@ -1,0 +1,53 @@
+# Integrationstest: Server + 3 Test-DJs (JACK dummy + JackTrip-Client) in einem Docker-Netz.
+# Aufruf über tests/integration/run.py (setzt NETEM, ITEST_OUT, ITEST_API_PORT).
+#
+# Netzstörung: tc netem im Client-Container (cap_add NET_ADMIN), wirkt auf den Upload des Clients
+# (Egress). Der Server-Container bleibt unverändert; die Downlink-Strecke ist ungestört.
+name: b2bit
+services:
+  server:
+    build:
+      context: ../..
+      target: runtime
+    image: b2b-relay:itest
+    environment:
+      B2B_API_HOST: 0.0.0.0
+      B2B_AUTO_ACTIVE: "false"          # der Orchestrator bestimmt den ersten Live-DJ
+      B2B_RECORD_DIR: /rec
+      B2B_RECORD_FORMAT: float32
+      B2B_DRIFT_BASE_S: "10"
+    ports:
+      - "${ITEST_API_PORT:-18090}:8090"
+    volumes:
+      - ${ITEST_OUT:-./out}/rec:/rec
+  clientA: &client
+    build:
+      context: ../..
+      target: testclient
+    image: b2b-relay:itest-client
+    depends_on: [server]
+    cap_add: [NET_ADMIN]
+    environment:
+      DJ_NAME: A
+      NETEM: ${NETEM:-}
+      SERVER_HOST: server
+      API_URL: http://server:8090
+      CTL_DIR: /ctl
+    volumes:
+      - ${ITEST_OUT:-./out}/ctl:/ctl:ro
+  clientB:
+    <<: *client
+    environment:
+      DJ_NAME: B
+      NETEM: ${NETEM:-}
+      SERVER_HOST: server
+      API_URL: http://server:8090
+      CTL_DIR: /ctl
+  clientC:
+    <<: *client
+    environment:
+      DJ_NAME: C
+      NETEM: ${NETEM:-}
+      SERVER_HOST: server
+      API_URL: http://server:8090
+      CTL_DIR: /ctl

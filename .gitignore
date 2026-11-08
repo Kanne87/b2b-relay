@@ -6,3 +6,6 @@ build/
 dist/
 *.wav
 report.json
+
+tests/integration/out/
+recordings/

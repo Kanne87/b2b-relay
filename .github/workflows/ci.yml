@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/kanne87/b2b-relay
+
+jobs:
+  unit:
+    name: Unit-Tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+
+  image:
+    name: Image bauen und nach GHCR pushen
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: unit
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Anmeldung bei GHCR (nur Push auf main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Bauen (Push nur auf main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  integration:
+    name: Integrationstest (Docker + tc netem)
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    needs: unit
+    # Erster echter Lauf der Docker-Strecke: bis ein grüner Lauf vorliegt, blockiert ein Fehlschlag nichts.
+    # Danach auf false stellen (oder die Zeile löschen).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: netem im Container prüfen
+        run: |
+          sudo modprobe sch_netem || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; }
+          docker run --rm --cap-add NET_ADMIN ubuntu:24.04 bash -c \
+            'apt-get update -qq && apt-get install -y -qq iproute2 >/dev/null && tc qdisc add dev lo root netem delay 1ms && tc qdisc show dev lo'
+      - name: Integrationstest (3 Profile x 10 Übergaben)
+        run: python tests/integration/run.py --out "$RUNNER_TEMP/itest"
+      - name: Bericht in die Job-Zusammenfassung
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/itest/report.md" ]; then cat "$RUNNER_TEMP/itest/report.md" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: Bericht als Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-report
+          path: |
+            ${{ runner.temp }}/itest/report.md
+            ${{ runner.temp }}/itest/results.json
+            ${{ runner.temp }}/itest/*/analysis.json
+            ${{ runner.temp }}/itest/*/status.jsonl
+            ${{ runner.temp }}/itest/*/compose.log
+            ${{ runner.temp }}/itest/*/rec/*.trace.jsonl
+          if-no-files-found: warn
+          retention-days: 30

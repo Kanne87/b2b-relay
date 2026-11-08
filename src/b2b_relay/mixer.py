@@ -221,6 +221,8 @@ class RelayMixer:
         self.last_block: BlockInfo | None = None
         self._stage: VarispeedReader | None = None
         self._ctl: BufferController | None = None
+        self._master: RelayMixer | None = None      # Folger-Modus (siehe ``follow``)
+        self._blk_start: tuple[int, float] = (0, 0.0)   # Leseposition (int, frac) vor dem Block
         if c.target_buffer_s is not None:
             self._stage = VarispeedReader(-float(self._D))
             self._ctl = BufferController(c.target_buffer_s, c.deadband_s, c.max_dev, c.max_slew)
@@ -352,6 +354,8 @@ class RelayMixer:
         for name in blocks_by_source:
             if name not in self._sources:
                 raise ValueError(f"unbekannte Quelle {name!r}")
+        if self._master is not None:
+            return self._process_follower(blocks_by_source, n)
         if n is None:
             n = len(next(iter(blocks_by_source.values()))) if blocks_by_source else self.cfg.block_size
         w0 = self._wall
@@ -385,6 +389,7 @@ class RelayMixer:
         """Ausgabeblock mit geregelter Rate; ohne aktive Quelle bleibt die Rate 1."""
         st, ctl = self._stage, self._ctl
         pos = st.position
+        self._blk_start = (st.pos_int, st.pos_frac)
         r0 = 1.0 + ctl.dev
         if self._active is not None:
             ctl.step(self._buffer_at(pos + st.advance_of(n, r0, r0)), n / self.fs)
@@ -392,6 +397,72 @@ class RelayMixer:
         out = st.render(lambda t0, m: self._compose(t0, m, count=True), n, r0, r1)
         self.last_block = BlockInfo(n, pos, r0, r1, self._buffer_at(st.position))
         return out
+
+    # ------------------------------------------------------------------ Folger / Umlabeln
+
+    def follow(self, master: "RelayMixer") -> None:
+        """Folger-Modus für einen zweiten Kanal (Stereo: Mitte im Master, Seite im Folger).
+
+        Der Folger misst und entscheidet nichts: Lag-Schätzer (dasselbe ``LagTracker``-Objekt),
+        Umschaltliste, aktive Quelle, Ausgabeposition und Rate kommen vom Master, der **vor** dem
+        Folger mit gleich langen Blöcken verarbeitet. Gleiche Konfiguration und gleiche Quellen
+        (Reihenfolge egal) sind Voraussetzung. Die Ausgabe ist dadurch sample-genau auf das
+        Raster des Masters ausgerichtet; die Summe aus beiden Kanälen (L = M+S, R = M−S) bleibt
+        phasenrichtig."""
+        if master is self or master.cfg.sample_rate != self.cfg.sample_rate:
+            raise ValueError("ungültiger Master")
+        self._master = master
+
+    def _process_follower(self, blocks: dict[str, np.ndarray], n: int | None) -> np.ndarray:
+        m = self._master
+        if n is None:
+            n = len(next(iter(blocks.values()))) if blocks else self.cfg.block_size
+        if m._wall != self._wall + n:
+            raise RuntimeError("Master muss denselben Block vor dem Folger verarbeiten")
+        for name, s in self._sources.items():
+            blk = blocks.get(name)
+            if blk is None:
+                blk = np.zeros(n, dtype=np.float32)
+            elif len(blk) != n:
+                raise ValueError("alle Blöcke müssen gleich lang sein")
+            s.ring.write(np.asarray(blk, dtype=np.float32))
+            if name in m._sources:
+                s.tracker = m._sources[name].tracker
+        self._wall = m._wall
+        self._segments, self._active, self._previous = m._segments, m._active, m._previous
+        self._cur_seg = m._cur_seg
+        if self._stage is None or m.last_block is None:
+            self._t_blk = m._t_blk
+            return self._compose(self._t_blk, n, count=False).astype(np.float32)
+        i, f = m._blk_start
+        self._stage.pos_int, self._stage.pos_frac = i, f
+        lb = m.last_block
+        self._t_blk = i
+        return self._stage.render(lambda t0, k: self._compose(t0, k, count=False),
+                                  n, lb.r0, lb.r1).astype(np.float32)
+
+    def retime(self, delta: int) -> None:
+        """Programmzeit umlabeln: T' = T + ``delta`` (ganze Samples). Rein buchhalterisch: alle Lags
+        sinken um ``delta``, Umschaltpunkte, Ausgabeposition und Schätzer-Verlauf wandern mit, die
+        Leseposition in den Quell-Ringen (Wanduhr) bleibt exakt gleich - das Audio ändert sich nicht.
+        Dient der Verankerung der Zeitachse an der Wanduhr (live/drift.py). Nicht für Folger."""
+        if self._master is not None:
+            raise RuntimeError("retime am Master aufrufen; der Folger übernimmt den Stand")
+        d = int(delta)
+        if d == 0:
+            return
+        for s in self._sources.values():
+            s.tracker.shift(d)
+        for g in self._segments:
+            g.t_start += d
+        self._t_blk += d
+        if self._stage is not None:
+            self._stage.pos_int += d
+        if self.last_block is not None:
+            self.last_block = BlockInfo(self.last_block.n, self.last_block.pos + d, self.last_block.r0,
+                                        self.last_block.r1, self.last_block.buffer_s)
+        self._blk_start = (self._blk_start[0] + d, self._blk_start[1])
+        self._event("retime", delta=d)
 
     def read_program(self, t0: int, n: int, source: str | None = None) -> np.ndarray:
         """Programm P(T) für T in [t0, t0+n) mit dem heutigen Stand (Rückkanal/Monitor).

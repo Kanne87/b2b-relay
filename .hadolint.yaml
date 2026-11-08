@@ -1,0 +1,5 @@
+# DL3008/DL3013: apt- und pip-Versionen bewusst nicht gepinnt (Ubuntu 24.04 liefert Sicherheitsupdates
+# unter gleichem Paketnamen; das Python-Paket kommt aus diesem Repo, Abhängigkeiten über pyproject).
+ignored:
+  - DL3008
+  - DL3013

@@ -1,0 +1,36 @@
+# Serverbetrieb b2b-relay (Scheibe 2a). Läuft mit network_mode: host, damit JackTrip seine UDP-Ports
+# (Hub-Worker ab 61002, je Client einer) ohne NAT-Mapping selbst öffnen kann.
+#
+#   TCP 4464        JackTrip-Hub-Handshake (DJs verbinden sich hierhin)
+#   UDP 61002-62000 JackTrip-Hub-Worker (Audio; bei 3-5 DJs 61002-61006)
+#   TCP 8090        HTTP-API (B2B_API_PORT); Vorgabe im Image: nur 127.0.0.1 -> für Zugriff von außen
+#                   B2B_API_HOST=0.0.0.0 UND B2B_API_TOKEN setzen
+services:
+  b2b-relay:
+    image: ghcr.io/kanne87/b2b-relay:latest
+    build:
+      context: .
+      target: runtime
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      JACK_RATE: ${JACK_RATE:-48000}
+      JACK_PERIOD: ${JACK_PERIOD:-256}
+      JACK_REALTIME: ${JACK_REALTIME:-0}
+      JACKTRIP_QUEUE: ${JACKTRIP_QUEUE:-auto}
+      JACKTRIP_UDP_BASE: ${JACKTRIP_UDP_BASE:-61002}
+      B2B_API_HOST: ${B2B_API_HOST:-127.0.0.1}
+      B2B_API_PORT: ${B2B_API_PORT:-8090}
+      B2B_API_TOKEN: ${B2B_API_TOKEN:-}
+      B2B_TARGET_BUFFER_S: ${B2B_TARGET_BUFFER_S:-3.0}
+      B2B_DEFAULT_ROLE: ${B2B_DEFAULT_ROLE:-dj}
+      B2B_ROLES: ${B2B_ROLES:-}
+      B2B_RECORD_DIR: ${B2B_RECORD_DIR:-}
+      B2B_RECORD_FORMAT: ${B2B_RECORD_FORMAT:-pcm16}
+    volumes:
+      - ${B2B_RECORD_HOST_DIR:-./recordings}:/rec
+    # Echtzeit-Scheduling für jackd (nur mit JACK_REALTIME=1); ohne diese Zeilen läuft jackd mit --no-realtime
+    # cap_add: [SYS_NICE]
+    # ulimits:
+    #   rtprio: 95
+    #   memlock: -1
