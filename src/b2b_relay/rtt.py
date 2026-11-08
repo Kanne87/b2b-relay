@@ -98,6 +98,7 @@ class LagTracker:
         self.rate = 0.0
         self.t_ref = 0.0
         self.locked = False
+        self.reacquiring = False     # Lag hat sich sprunghaft geändert: neu einrasten, alte Schätzung gilt weiter
         self.confidence = 0.0
         self.last_update = None      # Wanduhr der letzten angenommenen Messung
         self._cand: tuple[float, float] | None = None
@@ -110,7 +111,23 @@ class LagTracker:
         self.lag, self.rate, self.t_ref = float(lag), 0.0, float(t)
         self._hist.clear()
         self.locked = True
+        self.reacquiring = False
         self.confidence = 1.0
+
+    def begin_reacquire(self) -> None:
+        """Der Lag springt (z. B. weil die Quelle jetzt einen anderen Rückkanal hört): neu einrasten wie
+        beim ersten Mal (zwei stimmige Messungen), ohne die bisherige Schätzung vorher zu verwerfen -
+        sie bleibt für bereits geplantes Audio gültig, bis die neue steht. Die Driftrate bleibt (die Uhr
+        der Quelle ändert sich nicht)."""
+        if self.locked:
+            self.reacquiring = True
+            self._cand = None
+            self._outliers.clear()
+
+    @property
+    def usable(self) -> bool:
+        """Eingerastet und nicht im Neu-Einrasten: die Schätzung gilt für neues Audio."""
+        return self.locked and not self.reacquiring
 
     def predict(self, t: float) -> float:
         return self.lag + self.rate * (t - self.t_ref)
@@ -129,6 +146,17 @@ class LagTracker:
     def update(self, t_c: float, delay: float, conf: float) -> bool:
         """Messung (Zeitpunkt = Fenstermitte) einarbeiten. True, wenn angenommen."""
         if conf < self.min_conf:
+            return False
+        if self.reacquiring:
+            if self._cand is not None and abs(delay - self._cand[1]) <= self.gate and t_c > self._cand[0]:
+                t0, d0 = self._cand
+                self.lag, self.t_ref, self.reacquiring = float(delay), float(t_c), False
+                self.confidence, self.last_update = conf, t_c
+                self.n_updates += 1
+                self._cand = None
+                self._hist = [(t0, d0), (t_c, delay)]
+                return True
+            self._cand = (t_c, delay)
             return False
         if not self.locked:
             if self._cand is not None and abs(delay - self._cand[1]) <= self.gate \

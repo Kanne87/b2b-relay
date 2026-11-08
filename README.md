@@ -72,9 +72,19 @@ bestimmten Rate weiter.
 
 **Übergabe** (`request_handoff(ziel, at=None)`): sofort (am Live-Rand des Programms) oder zur Programmzeit `at`
 (Sekunden). Crossfade 50–200 ms (`fade_s`), raised-cosine mit Gewichtssumme 1. Verweigert mit Code und Klartext:
-`rtt_exceeds_buffer` (Lag des Ziels + Reserve > D), `not_locked`, `estimate_stale`, `target_silent`, `too_late`
+`rtt_exceeds_buffer` (Lag des Ziels + Reserve > D), `not_locked` (auch während des Neu-Einrastens, siehe unten), `estimate_stale`, `target_silent`, `too_late`
 (Zeitpunkt liegt schon vor dem Ausgaberand), `out_of_order`, `already_active`, `unknown_source`. Ist die Schätzung
 noch nicht eingerastet, prüft der Mixer gegen den RTT-Hinweis aus `register_source(name, rtt_hint_s=…)`.
+
+**Neu-Einrasten nach jedem Wechsel der aktiven Quelle.** Jeder wartende DJ hört den Feed der aktiven Quelle; wechselt
+sie, springt sein Lag um den Lag-Unterschied der beiden (`lag = lag_aktiv + RTT`). Die Nachführung sucht nur ±`gate_s`
+(3 ms) um die Vorhersage und fände den neuen Lag nicht. Deshalb rastet jede wartende Quelle, die bisherige
+Referenzquelle eingeschlossen, nach dem Wechsel neu ein: Messfenster erst ab `reacquire_delay_s` (3 s) danach,
+gesucht wird ±`reacquire_window_s` (100 ms, weniger als ein halber Beat) um Lag(neu aktiv) + bisherige RTT der Quelle
+(der Wechsel ändert die Bezugsquelle, nicht die Netzlaufzeit; ohne bekannte RTT oder nach `reacquire_narrow_s` = 8 s
+ohne Erfolg im vollen Bereich), zwei stimmige Messungen; bis dahin gilt die alte Schätzung weiter (für Audio, das noch im Puffer
+liegt), eine Übergabe an die Quelle wird mit `not_locked` verweigert, die Driftrate bleibt. Gemessen wird eine Quelle
+erst, wenn die Ausgabe ihr letztes Segment hinter sich hat. Maxima am Rand des Suchbereichs werden verworfen.
 
 **Fallback.** Liefert die aktive Quelle länger als `silence_timeout_s` (0,25 s) Stille (< −60 dBFS), schaltet der
 Mixer auf die vorige Quelle; der Crossfade endet dort, wo die Quelle verstummt ist (rückwirkend im Puffer, kein
@@ -453,13 +463,23 @@ reicht den Feed durch und mischt seine Kicks phasenrichtig dazu, wie in `sim/`).
 | Profil | netem (Client-Egress) |
 |---|---|
 | `clean` | keine |
-| `wan40` | `delay 40ms 5ms distribution normal` |
-| `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50%` |
+| `wan40` | `delay 40ms 5ms distribution normal rate 1000mbit` |
+| `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit` |
+
+`rate 1000mbit` hält die Paketreihenfolge: ohne `rate` sortiert netem jedes Paket nach seiner eigenen Zufallsverzögerung,
+bei 5 ms Jitter und 5,33 ms Paketabstand kämen rund 23 % der JackTrip-Pakete hinter ihrem Nachfolger an und gingen als
+Lücke verloren. Gewolltes Umordnen steht ausdrücklich im Profil (`reorder` in `wan120`).
+
+Bricht ein Profil ab (Zeitüberschreitung, beendeter Container), gibt `run.py` die letzten 200 Zeilen der Compose-Logs
+je Container aus (auch unter `<profil>/logs/`), wertet den Mitschnitt aus, soweit es ihn gibt, und schreibt
+`analysis.json` mit Feld `error`; die übrigen Profile laufen weiter. Ohne Docker bildet `tests/itest_sim.py` dieselbe
+Sitzung nach (Live-Server auf dem FakeJack-Prüfstand, drei `DjCore` aus `client.py` mit eigener RTT;
+`tests/test_itest_sim.py`).
 
 Ausgabe in `--out`: `report.md`, `results.json` und je Profil `rec/program-*.wav` (Mitschnitt der Programmausgabe),
 `rec/*.trace.jsonl` (Block-Zeilen: Mitschnitt-Index, Inhaltszeit, Rate, Puffer, Drift, xruns; Ereignisse), `status.jsonl`,
-`analysis.json`. Gemessen werden je Übergabe der Beat-Phasenfehler (Raster 22 s vor gegen 18 s nach dem Umschaltpunkt,
-in Inhaltszeit, also unabhängig vom Varispeed), Lücken, Sprung-Verhältnis (Klicks) sowie xruns und Puffer-/Raten-Verlauf.
+`analysis.json` (je Übergabe auch `lag_s` des Ziels). Gemessen werden je Übergabe der Beat-Phasenfehler (Raster 22 s vor gegen 18 s nach dem Umschaltpunkt,
+in Inhaltszeit, also unabhängig vom Varispeed), Lücken, Sprung-Verhältnis (Klicks) sowie xruns (Abnahme: nur während des Mitschnitts; die Startphase von jackd liegt davor) und Puffer-/Raten-Verlauf.
 Grenzen für die Abnahme: `tests/integration/analyze.py` (`LIMITS`). In GitHub Actions läuft der Test im Job
 `integration`, der Bericht ist Artifact und Job-Zusammenfassung.
 
