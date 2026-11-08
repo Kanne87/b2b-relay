@@ -110,20 +110,23 @@ Weitere Schalter: `--human-error-ms` (±5), `--mix-bars` (8), `--buffer-s` (2,0)
 `--fade-ms` (100), `--block` (512). Exit-Code 1, wenn ein Abnahmekriterium reißt.
 
 Modell: synthetische 174-BPM-Tracks (Kick/Snare/Hi-Hat/Bass/Stabs, je Track per Seed, Bar-Muster variieren).
-Szenario A→B→A…: jeder DJ mischt nach der Übernahme zwei eigene Tracks hinein, der andere hört zu (Rückkanal mit
-Downlink-Latenz), startet seinen Track phasengenau mit menschlichem Fehler (Standard ±5 ms gleichverteilt) und
+Szenario A→B→A…: jeder DJ mischt nach der Übernahme zwei eigene Tracks hinein, der andere hört zu (Rückkanal =
+Roh-Feed der abgebenden Quelle mit Downlink-Latenz, `mixer.read_feed`), startet seinen Track phasengenau mit menschlichem Fehler (Standard ±5 ms gleichverteilt) und
 mischt über N Takte (Bass-Swap in der Mitte, Rückkanal per EQ/Fader ausgeblendet). Der Rückkanal ist per Tiefpass
 in Bass/Höhen geteilt. Transport: feste Latenz je Richtung = RTT/2 einschließlich Jitter-Puffer, Pakete zu 128 Samples
 mit Zufallsverlust und exponentialverteilter Verspätung (verspätet = verloren), Verlust = Nullen. Taktdrift: A läuft
 +ppm, B −ppm schnell (Lag wandert mit der Zeit). Die erste Quelle definiert T; der Lag jedes späteren DJs ist
-Lag der Programmquelle + eigene RTT + Drift (siehe Grenzen: Lag summiert sich).
+wahrer Lag der Programmquelle + eigene RTT + Drift (siehe Grenzen: Lag summiert sich). Die wahren Lags laufen im
+Simulator getrennt von der Zeitachse des Mixers (die mit *geschätzten* Lags geführt wird); der aufsummierte
+Schätzfehler (Versatz und Driftrate der Achse, `grid_offset_ms`, wenige ms) wird bei allen Messungen herausgerechnet
+(`Frames` in `sim/scenario.py`), weil er im Raster steckt und nichts zwischen den Quellen verschiebt.
 
 **Report** (`report.json`): `summary`, `acceptance`, `link_stats`, `mixer_events` und je Übergabe:
 
 | Feld | Bedeutung |
 |---|---|
 | `rtt_true_ms`, `rtt_est_ms`, `rtt_error_ms` | wahre/geschätzte RTT (Lag relativ zur Programmquelle), Fehler = Schätzung − Wahrheit |
-| `lag_true_ms`, `lag_est_ms` | kumulierter Lag relativ zur Zeitachse |
+| `lag_true_ms`, `lag_est_ms`, `grid_offset_ms` | kumulierter Lag relativ zur Zeitachse des Mixers (wahr: im Raster des Mixers ausgedrückt); Versatz der Mixer-Achse gegen das wahre Raster |
 | `beat_phase_error_ms`, `beat_phase_error_max_abs_ms` | Phasenfehler des Programms an der Übergabe: Kick-Onsets nach dem Crossfade gegen das erwartete Raster, abzüglich der Lage vor der Übergabe (`beat_offset_before_ms`); isoliert den Relay-Anteil |
 | `dj_human_error_ms` | modellierter menschlicher Einstartfehler (getrennt) |
 | `new_track_phase_error_ms`, `new_track_relay_error_ms` | Phase der Kicks des neuen Tracks nach dem Bass-Swap (= menschlicher + Relay-Fehler) und Rest nach Abzug des menschlichen Fehlers |
@@ -265,6 +268,20 @@ Zusätzlich im Report (`report.json`):
 Zuschauer-Verzögerung = Wanduhr − Zeitpunkt, zu dem der jeweils live spielende DJ den gerade ausgegebenen Inhalt
 gespielt hat (Ankunft beim Server − RTT/2, aus der wahren Lag-Funktion des Simulators).
 
+### Ergebnis des Abnahmelaufs (Seed 1, 30 Übergaben, 31 min Programm)
+
+| Kennzahl | Wert |
+|---|---|
+| Übergaben akzeptiert | 30/30 (Abstand 62 s) |
+| Puffer B | min 1,99 s (Start), max 2,95 s, Ende 2,95 s; nach den Übergaben nie unter 2,27 s; Untergrenze 1,0 s |
+| Tempo r | 0,9950 … 1,0000 (173,13 … 174,00 BPM), `max |r−1|` = 0,0050 |
+| Zuschauer-Verzögerung | max 3,20 s, Mittel 2,94 s, Ende 3,10 s (Grenze 4 s) |
+| Ausgabeverzögerung `D_eff` am Ende | 7,44 s (Summe der Lags 4,46 s) |
+| RTT-Fehler | max 0,40 ms |
+| Beat-Phase an Übergaben | max 1,26 ms (Grenze 3 ms) |
+| Lücken (unerklärt) | 0 |
+| Laufzeit / Speicher | 2:28 min, RSS 1,55 GB |
+
 ## Grenzen (Scheibe 1)
 
 * **Der Lag summiert sich über Übergaben.** Der übernehmende DJ hört das Programm erst, wenn es beim Server
@@ -301,3 +318,8 @@ gespielt hat (Ankunft beim Server − RTT/2, aus der wahren Lag-Funktion des Sim
   wahren Lag-Funktion berechnet, im Betrieb nur aus der Schätzung.
 * Die Simulation misst im T-Raster; dafür wird der Ausgang kubisch zurückinterpoliert (nur Messpfad, nicht
   Produktpfad).
+* **Die Zeitachse des Mixers driftet gegen das wahre Raster.** Der Mixer misst jeden neuen Lag relativ zum
+  Programm, das er mit dem *geschätzten* Lag der vorigen Quelle zusammensetzt; Fehler der Driftrate (einige 10 ppm
+  je Übergabe) summieren sich deshalb über die Kette (Simulation: `grid_offset_ms` bis 118 ms nach 30 Übergaben,
+  im Mittel ≈ 60 ppm Tempoabweichung der Achse). Zwischen den Quellen verschiebt das nichts (RTT-Fehler und
+  Beat-Phase bleiben klein), das Programm läuft aber mit leicht falscher Taktrate. Vorschlag in der PR-Beschreibung.
