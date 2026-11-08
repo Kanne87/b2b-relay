@@ -42,7 +42,7 @@ class WavWriter:
     def write(self, chans: list[np.ndarray] | tuple[np.ndarray, ...]) -> None:
         x = np.stack(chans, axis=1)                  # (n, ch) verschachtelt
         if self.fmt == "pcm16":
-            x = (np.clip(x, -1.0, 1.0) * 32767.0).round().astype("<i2")
+            x = np.clip(np.round(x * 32768.0), -32768, 32767).astype("<i2")
         else:
             x = x.astype("<f4")
         self._f.write(x.tobytes())
