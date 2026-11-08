@@ -83,8 +83,9 @@ class SimDJ:
         for t in plan.tracks:
             if t.dj != self.name:
                 continue
+            trk = plan.track_of(t)
             i0 = max(0, int(np.floor(t.start)) - 2)
-            i1 = int(np.ceil(t.start + t.track.n))
+            i1 = int(np.ceil(t.start + trk.n))
             i1 = min(i1, self.M.shape[0])
             T = np.arange(i0, i1, dtype=np.float64)
             gl, gh = plan.own_gains(t, T)
@@ -92,7 +93,7 @@ class SimDJ:
             if not keep.any():
                 continue
             pos = T - t.start
-            seg = gl * frac_read(t.track.low, pos) + gh * frac_read(t.track.high, pos)
+            seg = gl * frac_read(trk.low, pos) + gh * frac_read(trk.high, pos)
             self.M[i0:i1] += seg.astype(np.float32)
 
     def start_stint(self, ho: PHandoff, mixer: RelayMixer) -> Stint:

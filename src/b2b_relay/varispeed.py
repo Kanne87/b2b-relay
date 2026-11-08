@@ -10,7 +10,7 @@ bleibt in [0, 1). So bleibt die Genauigkeit unabhängig von der Laufzeit (float6
 nichts Hörbares, aber es gäbe keine feste Schranke).
 
 Interpolation: fensterbewertete Sinc-Interpolation (Kaiser, 32 Stützstellen, Tabelle mit
-linearer Zwischenstufe). Bruchteil 0 liefert exakt den Eingangswert; der Frequenzgang ist
+32768 Phasen, nächste Phase: Positionsfehler < 0,00002 Sample). Bruchteil 0 liefert exakt den Eingangswert; der Frequenzgang ist
 bis ca. 18 kHz auf < 0,01 dB flach und hängt kaum vom Bruchteil ab (kubisches Lagrange würde
 bei ständig wanderndem Bruchteil die Höhen mit der Wanderfrequenz amplitudenmodulieren).
 
@@ -31,7 +31,7 @@ ReadFn = Callable[[int, int], np.ndarray]
 class SincTable:
     """Polyphase-Tabelle: ``rows[m]`` sind die Gewichte für den Bruchteil ``m / phases``."""
 
-    def __init__(self, half: int = 16, phases: int = 2048, beta: float = 8.0) -> None:
+    def __init__(self, half: int = 16, phases: int = 32768, beta: float = 8.0) -> None:
         self.half, self.phases = half, phases
         k = np.arange(-half + 1, half + 1, dtype=np.float64)           # Stützstellen -H+1 .. H
         f = (np.arange(phases + 1, dtype=np.float64) / phases)[:, None]
@@ -100,11 +100,13 @@ class VarispeedReader:
         hi = self.pos_int + int(ip[-1]) + H
         seg = np.asarray(read(lo, hi - lo + 1), dtype=np.float64)
         idx = (ip - int(ip[0]))[:, None] + (tab.k[None, :] + H - 1)
-        u = frac * tab.phases
-        m = np.minimum(u.astype(np.int64), tab.phases - 1)
-        a = (u - m)[:, None]
-        w = tab.rows[m] * (1.0 - a) + tab.rows[m + 1] * a
-        out = np.einsum("ik,ik->i", seg[idx], w)
+        if r0 == 1.0 and r1 == 1.0:
+            # Tempo 1: der Bruchteil bleibt im ganzen Block gleich → eine Faltung genügt
+            m = int(self.pos_frac * tab.phases + 0.5)
+            out = np.convolve(seg, tab.rows[m][::-1], mode="valid")[:n]
+        else:
+            m = (frac * tab.phases + 0.5).astype(np.int64)
+            out = np.einsum("ik,ik->i", seg[idx], tab.rows[m])
         total = self.pos_frac + float(off[-1])
         step = int(np.floor(total))
         self.pos_int += step
@@ -125,9 +127,7 @@ def sinc_frac_read(buf: np.ndarray, pos: np.ndarray) -> np.ndarray:
     frac = pos - ip
     ok = (ip >= H - 1) & (ip <= buf.shape[0] - 1 - H)
     ipc = np.clip(ip, H - 1, buf.shape[0] - 1 - H)
-    u = frac * tab.phases
-    m = np.minimum(u.astype(np.int64), tab.phases - 1)
-    a = (u - m)[:, None]
-    w = tab.rows[m] * (1.0 - a) + tab.rows[m + 1] * a
-    y = np.einsum("ik,ik->i", np.asarray(buf, dtype=np.float64)[ipc[:, None] + tab.k[None, :]], w)
+    m = (frac * tab.phases + 0.5).astype(np.int64)
+    y = np.einsum("ik,ik->i", np.asarray(buf, dtype=np.float64)[ipc[:, None] + tab.k[None, :]],
+                  tab.rows[m])
     return np.where(ok, y, 0.0)
