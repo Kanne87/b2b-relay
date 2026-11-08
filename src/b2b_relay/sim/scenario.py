@@ -103,6 +103,58 @@ class _ProgramView:
         return frac_read(self.outs[i0:i1], j - i0).astype(np.float32)
 
 
+class Frames:
+    """Abbildung zwischen der Zeitachse des Mixers und dem wahren Raster der DJs.
+
+    Der Mixer führt die Achse mit seinen *geschätzten* Lags; die Rückkanal-Kette der DJs läuft mit
+    den wahren Lags. Beide weichen um den aufsummierten Schätzfehler ab (Versatz und Driftrate,
+    Größenordnung ms bis 100 ms nach vielen Übergaben); der Fehler steckt im Raster, nicht zwischen
+    den Quellen. Je Epoche (Quelle, die aktiv ist) gilt: Inhalt, der beim Mixer als Achsenzeit T_est
+    erscheint, ist wahre Inhaltszeit T_true = w − lag_wahr(w) mit w = Ankunft nach der Schätzgeraden."""
+
+    def __init__(self, stint0) -> None:
+        self.t_est = [-1e30]
+        self.t_true = [-1e30]
+        self.est = [(0.0, 0.0, 0.0)]
+        self.stints = [stint0]
+
+    def add(self, t_est: float, t_true: float, est: tuple, stint) -> None:
+        self.t_est.append(float(t_est))
+        self.t_true.append(float(t_true))
+        self.est.append(tuple(float(v) for v in est))
+        self.stints.append(stint)
+
+    def _idx(self, T: np.ndarray, bounds: list, era: int | None) -> np.ndarray:
+        if era is not None:
+            return np.full(T.shape, era, dtype=np.int64)
+        return np.searchsorted(np.array(bounds), T, side="right") - 1
+
+    def to_true(self, T, era: int | None = None):
+        a = np.atleast_1d(np.asarray(T, dtype=np.float64))
+        idx = self._idx(a, self.t_est, era)
+        out = np.empty_like(a)
+        for i in np.unique(idx):
+            m = idx == i
+            l0, rho, tre = self.est[i]
+            w = (a[m] + l0 - rho * tre) / (1.0 - rho)
+            out[m] = w - self.stints[i].lag(w)
+        return out if np.ndim(T) else float(out[0])
+
+    def to_est(self, T, era: int | None = None):
+        a = np.atleast_1d(np.asarray(T, dtype=np.float64))
+        idx = self._idx(a, self.t_true, era)
+        out = np.empty_like(a)
+        for i in np.unique(idx):
+            m = idx == i
+            st = self.stints[i]
+            w = a[m] + st.lag(a[m] + 1.0)
+            for _ in range(5):
+                w = a[m] + st.lag(w)
+            l0, rho, tre = self.est[i]
+            out[m] = w - (l0 + rho * (w - tre))
+        return out if np.ndim(T) else float(out[0])
+
+
 def _solve_arrival(stint, t: float) -> float:
     """Wanduhr w, zu der der Programminhalt t im Feed des DJs eintrifft (w − lag(w) = t)."""
     return stint.arrival(t)
@@ -149,6 +201,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         log(f"Plan: {len(plan.tracks)} Tracks, {plan.t_end / fs:.0f} s Programm, {w_end // cfg.block} Blöcke")
 
     stage = [0] * len(plan.handoffs)
+    frames = Frames(djs[names[0]].stints[0])
     snap: list[dict] = [dict() for _ in plan.handoffs]
     outs = np.zeros(w_end, dtype=np.float32)
     aborted = None
@@ -167,13 +220,16 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
                 snap[ho.index]["stint"] = djs[ho.dst].start_stint(ho, snap[ho.index]["src_stint"])
                 stage[ho.index] = 1
             if stage[ho.index] == 1 and live >= ho.t_h - 2 * fs:
-                res = mixer.request_handoff(ho.dst, at=ho.t_h / fs)
+                # Übergabezeit im Raster des Mixers: dort, wo der neue Track des DJs einsetzt
+                res = mixer.request_handoff(ho.dst, at=frames.to_est(float(ho.t_h)) / fs)
                 snap[ho.index]["result"] = res
                 snap[ho.index]["buffer_request_s"] = mixer.buffer_s
                 snap[ho.index]["wall_request"] = w
                 snap[ho.index]["params"] = mixer.lag_params(ho.dst)
                 snap[ho.index]["info"] = mixer.source_info(ho.dst)
                 snap[ho.index]["lag_x"] = mixer.lag_params(ho.src)
+                if res.accepted:
+                    frames.add(res.t_switch, ho.t_h, snap[ho.index]["params"], snap[ho.index]["stint"])
                 stage[ho.index] = 2
                 if not res.accepted:
                     aborted = {"handoff": ho.index, "reason": res.reason, "message": res.message}
@@ -201,6 +257,8 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
     prog = _ProgramView(outs, omap, int(plan.t_end) + 2 * fs)     # prog[T] = P(T)
     loss_iv = np.array(sorted(i for d in djs.values() for i in d.loss_intervals), dtype=np.float64)
     loss_iv = loss_iv.reshape(-1, 2)
+    if len(loss_iv):                        # wahres Raster → Zeitachse des Mixers
+        loss_iv = np.column_stack([frames.to_est(loss_iv[:, 0]), frames.to_est(loss_iv[:, 1])])
 
     def P(T0: int, n_: int) -> np.ndarray:
         return prog[T0:T0 + n_]
@@ -258,11 +316,15 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         trk_old, trk_new = plan.track_of(old), plan.track_of(new)
         fade = int(cfg.fade_ms * 1e-3 * fs)
 
-        def ref_old(pos, old=old):
-            return frac_read(trk_old.low, pos - old.start).astype(np.float64)
+        t_sw = int(res.t_switch)            # Umschaltpunkt auf der Zeitachse des Mixers
+        era = ho.index                      # Raster der abgebenden Quelle (Schätzfehler dort ist kein Relay-Fehler)
 
-        def ref_new(pos, new=new):
-            return frac_read(trk_new.low, pos - (new.start - new.human_s * fs)).astype(np.float64)
+        def ref_old(pos, old=old, era=era):
+            return frac_read(trk_old.low, frames.to_true(pos, era) - old.start).astype(np.float64)
+
+        def ref_new(pos, new=new, era=era):
+            return frac_read(trk_new.low, frames.to_true(pos, era)
+                             - (new.start - new.human_s * fs)).astype(np.float64)
 
         swap = plan.swap_point(new)
         kt = trk_old.kick_times + old.start
@@ -271,6 +333,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         pad = int(0.35 * fs)
 
         def errs(kicks, ref):
+            kicks = frames.to_est(np.asarray(kicks, dtype=np.float64), era)
             ks = [k for k in kicks if 0 <= k - pad and k + pad < len(prog)]
             return kick_phase_errors(prog, ref, np.array(ks), fs, loss_iv)
 
@@ -302,9 +365,9 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         else:
             rep["new_track_phase_error_ms"] = rep["new_track_relay_error_ms"] = None
         # --- Sprünge und Lücken rund um die Übergabe
-        a, b = int(ho.t_h - 0.1 * fs), int(ho.t_h + fade + 0.1 * fs)
+        a, b = int(t_sw - 0.1 * fs), int(t_sw + fade + 0.1 * fs)
         seg = P(a, b - a)
-        base = P(int(ho.t_h - 1.5 * fs), int(1.4 * fs))
+        base = P(int(t_sw - 1.5 * fs), int(1.4 * fs))
 
         def loss_mask(T0, nn):
             m = np.zeros(nn, dtype=bool)
@@ -313,8 +376,8 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             return m
 
         rep["max_sample_jump"] = max_sample_jump(seg, loss_mask(a, b - a))
-        rep["max_sample_jump_baseline"] = max_sample_jump(base, loss_mask(int(ho.t_h - 1.5 * fs), len(base)))
-        ga = int(ho.t_h - 1.0 * fs)
+        rep["max_sample_jump_baseline"] = max_sample_jump(base, loss_mask(int(t_sw - 1.5 * fs), len(base)))
+        ga = int(t_sw - 1.0 * fs)
         gaps = find_gaps(P(ga, int(4.0 * fs)), fs)
         glist = []
         for s0, ln in gaps:
@@ -353,7 +416,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
     kk = np.arange(k_done)
     p_end = tr_p0[:k_done] + n * 0.5 * (tr_r0[:k_done] + tr_r1[:k_done])
     rate_blk = 0.5 * (tr_r0[:k_done] + tr_r1[:k_done])
-    live = [(ho.t_h, snap[ho.index]["stint"], names.index(ho.dst)) for ho in plan.handoffs
+    live = [(snap[ho.index]["result"].t_switch, snap[ho.index]["stint"], names.index(ho.dst)) for ho in plan.handoffs
             if snap[ho.index].get("result") is not None and snap[ho.index]["result"].accepted]
     first_stint = djs[names[0]].stints[0]
     series = []
