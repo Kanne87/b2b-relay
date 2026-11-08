@@ -79,7 +79,7 @@ class DjCore:
             g0 = self.grid - self.onset_delay                    # Kick-Anfänge
             lo = max(f0, self.last_t + 0.5 * sg.BEAT)            # nach Zeit statt Index: robust gegen Phasensprung
             k = int(np.ceil((lo - g0) / sg.BEAT))
-            while g0 + k * sg.BEAT < f0 + n:
+            while int(round(g0 + k * sg.BEAT)) < f0 + n:
                 t = g0 + k * sg.BEAT
                 i = int(round(t)) - f0
                 if 0 <= i < n:
