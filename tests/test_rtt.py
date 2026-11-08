@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from b2b_relay.rtt import LagTracker, gcc_phat
 from b2b_relay.timeline import frac_read
@@ -78,3 +79,19 @@ def test_tracker_rejects_single_outlier_but_reacquires_after_three():
     assert not tr.update(11 * 24000.0, 20000.0, 0.95)
     assert tr.update(12 * 24000.0, 20000.0, 0.95)
     assert abs(tr.lag - 20000.0) < 1.0
+
+
+def test_tracker_reacquires_after_lag_jump_and_keeps_old_estimate_meanwhile():
+    tr = LagTracker(gate=144.0)
+    for k in range(6):
+        tr.update(k * 24000.0, 1000.0 + 0.001 * k * 24000.0, 0.9)
+    assert tr.usable
+    rate = tr.rate
+    tr.begin_reacquire()
+    assert tr.locked and tr.reacquiring and not tr.usable
+    old = tr.predict(200000.0)
+    assert tr.update(200000.0, 9000.0, 0.9) is False             # erste Messung: nur Kandidat
+    assert tr.predict(200000.0) == old                            # bisherige Schätzung gilt weiter
+    assert tr.update(224000.0, 9000.0 + 0.001 * 24000.0, 0.9) is True
+    assert tr.usable and tr.predict(224000.0) == pytest.approx(9024.0)
+    assert tr.rate == rate                                        # Driftrate der Quelle bleibt

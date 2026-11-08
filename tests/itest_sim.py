@@ -52,7 +52,7 @@ def run_session(out_dir: Path, rtt_ms: dict[str, float], *, handovers: int = 3, 
     rig = Rig(tuple(names), cfg=cfg)
     rig.engine._open_record()
     djs = {n: DjCore(n) for n in names}
-    # RTT je DJ: halb Rückkanal, halb Upload (ganze Samples); dazu je ein Takt des Prüfstands
+    # RTT je DJ: halb Rückkanal, halb Upload (ganze Samples); dazu ein Takt des Prüfstands
     down = {n: Delay(int(round(rtt_ms[n] * 1e-3 * FS / 2))) for n in names}
     up = {n: Delay(int(round(rtt_ms[n] * 1e-3 * FS)) - int(round(rtt_ms[n] * 1e-3 * FS / 2))) for n in names}
     to_server = {n: (np.zeros(PERIOD, np.float32), np.zeros(PERIOD, np.float32)) for n in names}
