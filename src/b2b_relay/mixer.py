@@ -66,6 +66,8 @@ class RelayConfig:
     max_stale_s: float = 8.0            # ältere Schätzung → Übergabe verweigert
     reacquire_delay_s: float = 3.0      # nach einem Wechsel der aktiven Quelle: Messfenster der übrigen erst
                                         # ab hier (Rückkanal umgeschaltet, neuer Feed angekommen, Ausklang vorbei)
+    reacquire_window_s: float = 0.1     # Neu-Einrasten: Suche ± um Lag(aktiv) + bisherige RTT (< ½ Beat bei 174 BPM)
+    reacquire_narrow_s: float = 8.0     # so lange nur dort suchen, danach im vollen Bereich
     ring_s: float | None = None
 
     def __post_init__(self) -> None:
@@ -197,6 +199,8 @@ class _Source:
         self.last_active_wall: int | None = None
         self.is_reference = False
         self.est_from: int | None = None   # Wanduhr, ab der das Messfenster beginnen darf (Neu-Einrasten)
+        self.rtt: float | None = None       # Samples: Lag minus Lag der Quelle, die sie zuletzt gehört hat
+        self.reacq_until: int | None = None     # bis hier Neu-Einrasten nur um Lag(aktiv) + rtt
 
 
 class RelayMixer:
@@ -704,15 +708,24 @@ class RelayMixer:
             self._sources[old].last_active_wall = self._wall
             self._previous, self._active, self._cur_seg = old, nxt.src, nxt
             self._silent_flag = False
-            self._reacquire_waiting()
+            self._reacquire_waiting(old)
             self._event("handoff_effective", source=nxt.src, previous=old, t_switch=nxt.t_start)
 
-    def _reacquire_waiting(self) -> None:
+    def _reacquire_waiting(self, old: str) -> None:
         """Jede wartende Quelle hört den Feed der aktiven (Rückkanal); wechselt die aktive Quelle, springt
         ihr Lag um den Lag-Unterschied der beiden aktiven Quellen. Die Nachführung sucht nur ±gate um die
         Vorhersage und fände den neuen Lag nie (S3788) - also alle wartenden Quellen neu einrasten, die
-        bisherige Referenzquelle eingeschlossen."""
-        start = self._wall + int(self.cfg.reacquire_delay_s * self.fs)
+        bisherige Referenzquelle eingeschlossen. Ihre RTT (Lag gegen die gehörte Quelle) ändert der Wechsel
+        nicht: gesucht wird zuerst nur um Lag(neu aktiv) + RTT; das schließt Mehrdeutigkeiten periodischer
+        Musik (Beat-Abstand) aus, die eine Suche über den vollen Bereich treffen kann."""
+        c = self.cfg
+        start = self._wall + int(c.reacquire_delay_s * self.fs)
+        old_lag = self.lag_of(old)
+        for s in self._sources.values():
+            # wer bisher gewartet hat (auch die neue aktive Quelle), hörte ``old``; die RTT von ``old`` selbst
+            # stammt von ihrer eigenen Übernahme
+            if s.name != old and s.tracker.usable:
+                s.rtt = s.tracker.predict(self._wall) - old_lag
         for s in self._sources.values():
             if s.name == self._active:
                 s.tracker.reacquiring = False   # Rückfall auf eine Quelle im Neu-Einrasten: ihr Lag bleibt
@@ -721,6 +734,7 @@ class RelayMixer:
             s.is_reference = False
             s.tracker.begin_reacquire()
             s.est_from = start
+            s.reacq_until = start + int(c.reacquire_narrow_s * self.fs)
 
     def _still_rendered(self, name: str) -> bool:
         """Liest die Ausgabe noch ein Segment dieser Quelle (Übergang im Puffer)? Dann darf ihr Lag
@@ -784,6 +798,10 @@ class RelayMixer:
             pred = s.tracker.predict(t_c)
             lo = int(np.floor(pred - s.tracker.gate))
             hi = int(np.ceil(pred + s.tracker.gate))
+        elif s.tracker.reacquiring and s.rtt is not None and self._wall < (s.reacq_until or 0):
+            mid = act_lag + s.rtt
+            lo = int(np.floor(max(mid - c.reacquire_window_s * fs, act_lag + c.min_rtt_s * fs)))
+            hi = int(np.ceil(mid + c.reacquire_window_s * fs))
         else:
             lo = int(np.ceil(act_lag + c.min_rtt_s * fs))
             hi = int(np.ceil(act_lag + c.search_max_s * fs))

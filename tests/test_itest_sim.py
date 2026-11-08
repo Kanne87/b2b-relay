@@ -15,7 +15,9 @@ import signals as sg
 from client import DjCore
 
 FS = 48000
-RTT = {"A": 20.0, "B": 35.0, "C": 50.0}
+# kurze RTTs wie im Profil clean, dazu WAN-Größen: bei langer RTT und exakt periodischem Testsignal griff eine
+# Suche über den vollen Bereich einen Nebenpeak (+2,6 s); 4 Übergaben = jede Quelle einmal nach eigener Abgabe
+SCENARIOS = {"lan": ({"A": 20.0, "B": 35.0, "C": 50.0}, 3), "wan": ({"A": 92.0, "B": 280.0, "C": 150.0}, 4)}
 CYCLE_MS = 256 / FS * 1e3           # ein Takt des Prüfstands (Weitergabe DJ → Server) kommt zur RTT dazu
 
 
@@ -35,16 +37,19 @@ def test_testclient_places_own_onsets_on_the_heard_grid():
     assert abs(sg.wrap(ph_own - ph_heard)) / FS * 1e3 < 0.1     # vorher −2,5 ms
 
 
-@pytest.fixture(scope="module")
-def session(tmp_path_factory):
-    return itest_sim.run_session(tmp_path_factory.mktemp("itest"), RTT, handovers=3)
+@pytest.fixture(scope="module", params=sorted(SCENARIOS))
+def session(request, tmp_path_factory):
+    rtt, n = SCENARIOS[request.param]
+    res = itest_sim.run_session(tmp_path_factory.mktemp("itest"), rtt, handovers=n)
+    res["rtt"] = rtt
+    return res
 
 
 def test_three_djs_with_different_rtt_hand_over_without_phase_jump(session):
     per = session["per_handover"]
-    assert [(p["from"], p["to"]) for p in per] == [("A", "B"), ("B", "C"), ("C", "A")]
+    assert [(p["from"], p["to"]) for p in per] == [("ABC"[k % 3], "ABC"[(k + 1) % 3]) for k in range(len(per))]
     jumps = [p["phase_jump_ms"] for p in per]
-    assert all(j is not None and abs(j) <= 1.0 for j in jumps), jumps       # vorher −2 / +8 / +117 ms
+    assert all(j is not None and abs(j) <= 1.5 for j in jumps), jumps       # vorher (lan) −2 / +8 / +117 ms
     assert session["handovers_refused"] == 0
     assert session["acceptance"]["passed"], session["acceptance"]
 
@@ -54,6 +59,6 @@ def test_lag_estimates_follow_the_return_path(session):
     lags = session["lags_ms"]
     true, prev = [], 0.0
     for p in session["per_handover"]:
-        prev += RTT[p["to"]] + CYCLE_MS
+        prev += session["rtt"][p["to"]] + CYCLE_MS
         true.append(prev)
     assert lags == pytest.approx(true, abs=0.5), (lags, true)

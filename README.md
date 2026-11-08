@@ -80,7 +80,9 @@ noch nicht eingerastet, prüft der Mixer gegen den RTT-Hinweis aus `register_sou
 sie, springt sein Lag um den Lag-Unterschied der beiden (`lag = lag_aktiv + RTT`). Die Nachführung sucht nur ±`gate_s`
 (3 ms) um die Vorhersage und fände den neuen Lag nicht. Deshalb rastet jede wartende Quelle, die bisherige
 Referenzquelle eingeschlossen, nach dem Wechsel neu ein: Messfenster erst ab `reacquire_delay_s` (3 s) danach,
-voller Suchbereich, zwei stimmige Messungen; bis dahin gilt die alte Schätzung weiter (für Audio, das noch im Puffer
+gesucht wird ±`reacquire_window_s` (100 ms, weniger als ein halber Beat) um Lag(neu aktiv) + bisherige RTT der Quelle
+(der Wechsel ändert die Bezugsquelle, nicht die Netzlaufzeit; ohne bekannte RTT oder nach `reacquire_narrow_s` = 8 s
+ohne Erfolg im vollen Bereich), zwei stimmige Messungen; bis dahin gilt die alte Schätzung weiter (für Audio, das noch im Puffer
 liegt), eine Übergabe an die Quelle wird mit `not_locked` verweigert, die Driftrate bleibt. Gemessen wird eine Quelle
 erst, wenn die Ausgabe ihr letztes Segment hinter sich hat. Maxima am Rand des Suchbereichs werden verworfen.
 
