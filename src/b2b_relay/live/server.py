@@ -16,6 +16,9 @@ from .jackio import JackIO
 def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
+    # Der JACK-Callback läuft in Python und braucht das GIL: Wechselintervall unter eine Periode (256 Frames
+    # = 5,3 ms) setzen, sonst kann ein rechnender Worker-Thread den Callback bis zu 5 ms aufhalten.
+    sys.setswitchinterval(0.0005)
     cfg = LiveConfig.from_env()
     engine = Engine(cfg)
     io = JackIO(cfg, engine)

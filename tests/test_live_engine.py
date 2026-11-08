@@ -160,6 +160,11 @@ def test_recording_writes_program_wav(stereo, tmp_path):
     fs, a = read_wav(wavs[0])
     assert fs == FS and a.shape[1] == 2 and abs(len(a) - rig.engine.proc) < 10
     assert np.abs(a[int(4 * FS):]).max() > 0.05
+    import json
+    lines = [json.loads(x) for x in wavs[0].with_suffix(".trace.jsonl").read_text().splitlines()]
+    blk = [x for x in lines if x["k"] == "blk"]
+    assert len(blk) == rig.engine.chunks and blk[1]["i"] == rig.cfg.chunk
+    assert all(abs(b["Tc"] - blk[0]["Tc"] - b["i"]) < 4 for b in blk[:50])    # Rate 1: Tc läuft mit dem Mitschnitt
 
 
 def test_worker_thread_path(stereo):
