@@ -4,7 +4,8 @@ import wave
 import numpy as np
 
 from b2b_relay.sim.__main__ import main
-from b2b_relay.sim.analysis import find_gaps, kick_phase_errors, max_sample_jump, onset_shift
+from b2b_relay.sim.analysis import (find_gaps, find_gaps_chunked, kick_phase_errors, max_sample_jump,
+                                    onset_shift)
 from b2b_relay.sim.plan import Plan, PlanConfig
 from b2b_relay.sim.synth import Track, beat_samples
 from b2b_relay.sim.transport import Link
@@ -126,3 +127,15 @@ def test_plan_min_gap_stretches_hold_time():
         big.track_of(t)
     assert len(big._cache) == 8
     assert big.track_of(big.tracks[0]) is not big.track_of(big.tracks[1])
+
+
+def test_chunked_gap_search_equals_plain_search():
+    rng = np.random.default_rng(0)
+    for t in range(60):
+        x = rng.standard_normal(5000) * 0.1
+        for _ in range(int(rng.integers(0, 8))):
+            a = int(rng.integers(0, 5000))
+            x[a:a + int(rng.integers(1, 900))] = 0
+        if t % 3 == 0:
+            x[:int(rng.integers(0, 500))] = 0
+        assert find_gaps(x, FS) == find_gaps_chunked(x, FS, chunk=int(rng.integers(300, 1200)))

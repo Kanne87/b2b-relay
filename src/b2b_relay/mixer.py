@@ -402,6 +402,12 @@ class RelayMixer:
         Feed (Rückkopplung). Was noch nicht angekommen ist, kommt als Null."""
         return self._compose(int(t0), int(n), count=False, only=source)
 
+    def read_feed(self, source: str, w0: int, n: int) -> np.ndarray:
+        """Roh-Feed einer Quelle nach Wanduhr-Index ``[w0, w0+n)`` (kein Lag, keine Resampling-
+        Korrektur). So kommt der Rückkanal beim DJ an: die abgebende Quelle wird unverändert zurück-
+        geschickt; was noch nicht angekommen oder schon überschrieben ist, kommt als Null."""
+        return self._get(source).ring.read(int(w0), int(n))
+
     # ------------------------------------------------------------------ Auskunft
 
     @property
@@ -555,7 +561,7 @@ class RelayMixer:
                 s.is_reference = False
         s.silence_run = n - 1 - int(loud[-1])
         s.had_signal = True
-        s.level_db = 20.0 * np.log10(float(np.sqrt(np.mean(np.square(blk, dtype=np.float64)))) + 1e-12)
+        s.level_db = 20.0 * np.log10(float(np.sqrt(float(blk.dot(blk)) / n)) + 1e-12)
 
     def _lag_params(self, s: _Source) -> tuple[float, float, float]:
         return s.tracker.lag, s.tracker.rate, s.tracker.t_ref

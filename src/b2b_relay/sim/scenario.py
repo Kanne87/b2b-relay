@@ -10,7 +10,7 @@ import numpy as np
 
 from ..mixer import RelayConfig, RelayMixer
 from ..timeline import frac_read
-from .analysis import find_gaps, kick_phase_errors, max_sample_jump
+from .analysis import find_gaps, find_gaps_chunked, kick_phase_errors, max_sample_jump
 from .dj import SimDJ
 from .plan import Plan, PlanConfig
 from .transport import PACKET, Link
@@ -105,10 +105,7 @@ class _ProgramView:
 
 def _solve_arrival(stint, t: float) -> float:
     """Wanduhr w, zu der der Programminhalt t im Feed des DJs eintrifft (w − lag(w) = t)."""
-    w = t + float(stint.lag(t + 1.0))
-    for _ in range(6):
-        w = t + float(stint.lag(w))
-    return w
+    return stint.arrival(t)
 
 
 def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
@@ -166,7 +163,8 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             if st == 2:
                 continue
             if st == 0 and live >= ho.t_arm - fs:
-                snap[ho.index]["stint"] = djs[ho.dst].start_stint(ho, mixer)
+                snap[ho.index]["src_stint"] = djs[ho.src].stints[-1]
+                snap[ho.index]["stint"] = djs[ho.dst].start_stint(ho, snap[ho.index]["src_stint"])
                 stage[ho.index] = 1
             if stage[ho.index] == 1 and live >= ho.t_h - 2 * fs:
                 res = mixer.request_handoff(ho.dst, at=ho.t_h / fs)
@@ -228,10 +226,14 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         l0, rho, tref = sn["params"]
         xl0, xrho, xtref = sn["lag_x"]
         w_h = _solve_arrival(st, ho.t_h)
-        lag_true = float(st.lag(w_h))
+        lag_true_abs = float(st.lag(w_h))
         lag_est = l0 + rho * (w_h - tref)
         wl = min(w_h - st.rtt, st.w_cut)
-        lx = xl0 + xrho * (wl - xtref)
+        lx = xl0 + xrho * (wl - xtref)                         # Lag der Programmquelle laut Mixer
+        lx_true = st.ref[0] + st.ref[1] * (wl - st.ref[2])      # … und in Wahrheit
+        # Der Mixer misst die RTT relativ zu seinem eigenen (geschätzten) Lag der Programmquelle;
+        # ein Fehler dort steckt im Raster der Zeitachse und verschiebt nichts gegeneinander.
+        lag_true = lx + (lag_true_abs - lx_true)               # wahrer Lag im Raster des Mixers
         rep.update({
             "rtt_true_ms": (lag_true - lx) / fs * 1e3,
             "rtt_est_ms": (lag_est - lx) / fs * 1e3,
@@ -239,6 +241,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             "lag_true_ms": lag_true / fs * 1e3,
             "lag_est_ms": lag_est / fs * 1e3,
             "program_lag_before_ms": lx / fs * 1e3,
+            "grid_offset_ms": (lx - lx_true) / fs * 1e3,       # aufsummierter Schätzfehler der Achse
             "confidence": float(sn["info"].confidence),
             "drift_est_ppm": float(rho * 1e6),
             "drift_true_ppm": float((djs[ho.dst].eps + xrho) * 1e6),
@@ -326,11 +329,16 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
         handoff_reports.append(rep)
 
     # globale Lückenprüfung über das ganze Programm
+    # Speicher freigeben, bevor die langen Auswertungen laufen (DJ-Master, gerenderte Tracks)
+    rtt_of = {nm: dj.rtt for nm, dj in djs.items()}
+    for dj in djs.values():
+        dj.M = None
+    plan._cache.clear()
     # Lücken im Ausgang (Ausgabe-Raster), danach in Programmzeit umgerechnet
     j_lo = int(np.ceil(omap.j_of(np.array([0.0]))[0]))
     j_hi = min(int(omap.j_of(np.array([float(plan.t_end)]))[0]), n * k_done)
     all_gaps = []
-    for g0, gl in find_gaps(outs[j_lo:j_hi], fs):
+    for g0, gl in find_gaps_chunked(outs[j_lo:j_hi], fs):
         t0 = float(omap.t_of(np.array([j_lo + g0]))[0])
         t1 = float(omap.t_of(np.array([j_lo + g0 + gl]))[0])
         all_gaps.append((t0, t1 - t0))
@@ -361,7 +369,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
             if t_h <= T_out:
                 cur, who = st_h, wi
         w_arr = _solve_arrival(cur, T_out)
-        w_play = w_arr - djs[names[who]].rtt / 2.0
+        w_play = w_arr - rtt_of[names[who]] / 2.0
         d_s = ((k + 1) * n - w_play) / fs
         delays.append((k, d_s))
         if k % series_hop < hop:

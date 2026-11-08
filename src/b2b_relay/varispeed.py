@@ -99,14 +99,14 @@ class VarispeedReader:
         lo = self.pos_int + int(ip[0]) - H + 1
         hi = self.pos_int + int(ip[-1]) + H
         seg = np.asarray(read(lo, hi - lo + 1), dtype=np.float64)
-        idx = (ip - int(ip[0]))[:, None] + (tab.k[None, :] + H - 1)
         if r0 == 1.0 and r1 == 1.0:
             # Tempo 1: der Bruchteil bleibt im ganzen Block gleich → eine Faltung genügt
             m = int(self.pos_frac * tab.phases + 0.5)
             out = np.convolve(seg, tab.rows[m][::-1], mode="valid")[:n]
         else:
             m = (frac * tab.phases + 0.5).astype(np.int64)
-            out = np.einsum("ik,ik->i", seg[idx], tab.rows[m])
+            win = np.lib.stride_tricks.sliding_window_view(seg, 2 * H)     # (len-2H+1, 2H), ohne Kopie
+            out = np.einsum("ik,ik->i", win[ip - int(ip[0])], tab.rows[m])
         total = self.pos_frac + float(off[-1])
         step = int(np.floor(total))
         self.pos_int += step
