@@ -8,8 +8,14 @@ Ein DJ erzeugt seinen Master ``M(T)`` auf der Programmzeit-Achse (Labels T):
   (EQ) und mit Fader-/Bass-Swap-Kurven ausgeblendet.
 
 Die Laufzeit steckt in ``Stint.lag(w)``: der Feed trifft beim Mixer zur Wanduhr ``w`` ein und
-trägt den Programminhalt ``T = w − lag(w)``. ``lag`` = Lag der Programmquelle zum Zeitpunkt, als
-sie P(T) lieferte, + RTT des DJs + Taktdrift seiner Audio-Schnittstelle (ppm) seit dem Anhören.
+trägt den Programminhalt ``T = w − lag(w)``. ``lag`` = wahrer Lag der Programmquelle zum Zeitpunkt,
+als sie P(T) lieferte, + RTT des DJs + Taktdrift seiner Audio-Schnittstelle (ppm) seit dem Anhören.
+
+Der Rückkanal ist der **Roh-Feed** der abgebenden Quelle (``mixer.read_feed``), wie im Betrieb: Er
+wird nicht mit den Schätzwerten des Mixers neu abgetastet. Sonst würden Schätzfehler der Driftrate
+zur „wahren“ Drift des nächsten DJs und die Drift über viele Übergaben als Irrfahrt wegdriften.
+Die Labels T des DJs liegen im Zeitraster der wahren Lags; das Raster des Mixers weicht davon um
+den aufsummierten Schätzfehler ab (wenige ms) und ist für die Phasenmessung unerheblich.
 """
 
 from __future__ import annotations
@@ -39,6 +45,13 @@ class Stint:
     eps: float                                # Taktdrift (relativ)
     w_cut: float = float("inf")               # ab hier wirkt die Programmquelle nicht mehr nach
 
+    def arrival(self, t: float) -> float:
+        """Wanduhr w, zu der der Programminhalt t im Feed dieses DJs eintrifft (w − lag(w) = t)."""
+        w = t + float(self.lag(t + 1.0))
+        for _ in range(6):
+            w = t + float(self.lag(w))
+        return w
+
     def lag(self, w: np.ndarray | float) -> np.ndarray | float:
         if self.ref is None:
             return np.zeros_like(w, dtype=np.float64) if isinstance(w, np.ndarray) else 0.0
@@ -54,6 +67,7 @@ class _Window:
     b: int
     done: int
     zi: np.ndarray | None = None
+    ref: tuple[float, float, float] | None = None   # wahrer Lag der Programmquelle (l0, rho, t_ref)
 
 
 class SimDJ:
@@ -83,8 +97,9 @@ class SimDJ:
         for t in plan.tracks:
             if t.dj != self.name:
                 continue
+            trk = plan.track_of(t)
             i0 = max(0, int(np.floor(t.start)) - 2)
-            i1 = int(np.ceil(t.start + t.track.n))
+            i1 = int(np.ceil(t.start + trk.n))
             i1 = min(i1, self.M.shape[0])
             T = np.arange(i0, i1, dtype=np.float64)
             gl, gh = plan.own_gains(t, T)
@@ -92,17 +107,24 @@ class SimDJ:
             if not keep.any():
                 continue
             pos = T - t.start
-            seg = gl * frac_read(t.track.low, pos) + gh * frac_read(t.track.high, pos)
+            seg = gl * frac_read(trk.low, pos) + gh * frac_read(trk.high, pos)
             self.M[i0:i1] += seg.astype(np.float32)
 
-    def start_stint(self, ho: PHandoff, mixer: RelayMixer) -> Stint:
-        """Der DJ beginnt, das Programm zu hören (Stint-Lag aus dem Stand des Mixers)."""
-        ref_name = ho.src
-        l0, rho, tref = mixer.lag_params(ref_name)
+    def start_stint(self, ho: PHandoff, src_stint: Stint) -> Stint:
+        """Der DJ beginnt, das Programm zu hören. Der Lag der Programmquelle ist ihr wahrer Lag
+        (linear in dem Bereich, in dem sie nichts mehr hört: Anstieg = ihre Taktdrift)."""
+        fs = self.fs
+        w_s = src_stint.arrival(ho.t_arm)
+        l0 = float(src_stint.lag(w_s))
+        rho = (float(src_stint.lag(w_s + fs)) - l0) / fs
+        tref = w_s
         w_arm = (ho.t_arm + l0 - rho * tref) / (1.0 - rho)
         w_cut = (self.plan.echo_window(ho)[1] + l0 - rho * tref) / (1.0 - rho)
         st = Stint(w_arm, (l0, rho, tref), self.rtt, self.eps, w_cut)
         self.stints.append(st)
+        for win in self.windows:
+            if win.ho is ho:
+                win.ref = (l0, rho, tref)
         return st
 
     def current_stint(self, w: float) -> Stint | None:
@@ -125,8 +147,12 @@ class SimDJ:
                 continue
             if win.zi is None:
                 win.zi = np.zeros(max(len(self._a), len(self._b)) - 1)
-            heard = mixer.read_program(a, b - a, source=win.ho.src).astype(np.float64)
             T = np.arange(a, b)
+            l0, rho, tref = win.ref
+            ws = (T + l0 - rho * tref) / (1.0 - rho)         # Wanduhr-Index im Feed der Quelle
+            lo = int(np.floor(ws[0])) - 2
+            seg = mixer.read_feed(win.ho.src, lo, int(np.floor(ws[-1])) + 4 - lo)
+            heard = frac_read(seg, ws - lo)
             lost = self.down_lost[T // PACKET]
             if lost.any():
                 if np.abs(heard[lost]).max(initial=0.0) > 1e-4:

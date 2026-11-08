@@ -6,7 +6,10 @@ Ablauf je ``process``-Aufruf (alle Quellen liefern gleich lange Blöcke, die "je
 2. Aktive Quelle nachziehen (Programmzeit am Live-Rand hat den Umschaltpunkt passiert?).
 3. Alle ``est_hop_s`` die RTT jeder wartenden Quelle gegen das Programm schätzen.
 4. Fallback prüfen (aktive Quelle still → vorige Quelle).
-5. Den Ausgabeblock mit festem Puffer ``D`` erzeugen: P(T) für T = w − D.
+5. Den Ausgabeblock erzeugen. Ohne Regelung (``target_buffer_s=None``) mit festem Puffer ``D``:
+   P(T) für T = w − D. Mit Regelung liest eine Varispeed-Stufe P(T) mit Rate ``r`` (siehe
+   ``control.py``, ``varispeed.py``); der Puffer ``B = Live-Rand − Ausgabeposition`` wird auf
+   ``target_buffer_s`` geregelt, statt mit jeder Übergabe um den Lag-Zuwachs zu schrumpfen.
 
 Das Programm P(T) wird nie als Block gespeichert, sondern beim Lesen aus den Quell-Ringen
 zusammengesetzt: P(T) = Σ_k gewicht_k(T) · feed_k(T + lag_k). Die Gewichte ergeben sich aus der
@@ -21,12 +24,15 @@ Programm als Rückkanal hört, kommt um den Lag der Programmquelle plus ihre eig
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from .control import BufferController
 from .rtt import LagTracker, gcc_phat
 from .timeline import SampleRing
+from .varispeed import VarispeedReader
 
 _BIG = 1 << 60
 
@@ -34,14 +40,22 @@ _BIG = 1 << 60
 @dataclass
 class RelayConfig:
     sample_rate: int = 48000
-    buffer_s: float = 2.0           # D: fester Ausgabepuffer
+    buffer_s: float = 2.0           # D: Ausgabepuffer (bei Regelung: Anfangswert)
     reserve_s: float = 0.3          # Jitter-/Schätzreserve: Übergabe nur wenn lag + reserve ≤ D
+                                    # (nur ohne Regelung; mit Regelung gilt min_buffer_s)
+    # --- elastischer Ausgang (None = fester Puffer D wie in Scheibe 1, Rate immer 1)
+    target_buffer_s: float | None = None    # Zielpuffer B_ziel (Empfehlung 3,0 s)
+    min_buffer_s: float = 1.0               # B_min: Untergrenze nach einer Übergabe
+    max_dev: float = 0.005                  # |r − 1| höchstens (0,5 %)
+    max_slew: float = 0.001                 # größte Änderung von r je Sekunde
+    deadband_s: float = 0.1                 # Totband ±, in dem r = 1 gehalten wird
+    bpm_ref: float = 174.0                  # nur für die Anzeige „äquivalente BPM“
     fade_s: float = 0.1             # Crossfade bei Übergabe (50–200 ms)
     block_size: int = 512           # Vorgabe, wenn process() ohne Blöcke aufgerufen wird
     est_window_s: float = 4.0
     est_min_window_s: float = 2.0
     est_hop_s: float = 0.5
-    search_max_s: float | None = None   # größter gesuchter Lag, Vorgabe 1.5·D
+    search_max_s: float | None = None   # größte gesuchte RTT über dem Lag der aktiven Quelle, Vorgabe 1.5·D
     min_rtt_s: float = 0.004
     min_conf: float = 0.5
     gate_s: float = 0.003
@@ -59,8 +73,20 @@ class RelayConfig:
             raise ValueError("buffer_s muss größer als reserve_s sein")
         if self.search_max_s is None:
             self.search_max_s = 1.5 * self.buffer_s
+        if self.target_buffer_s is not None:
+            if not 0.0 < self.min_buffer_s < self.target_buffer_s:
+                raise ValueError("min_buffer_s muss zwischen 0 und target_buffer_s liegen")
+            if self.target_buffer_s - self.deadband_s <= self.min_buffer_s:
+                raise ValueError("Totband reicht bis an min_buffer_s heran")
+            if self.buffer_s < self.min_buffer_s:
+                raise ValueError("buffer_s (Anfangspuffer) liegt unter min_buffer_s")
+            if not 0.0 < self.max_dev <= 0.05 or self.max_slew <= 0.0 or self.deadband_s < 0.0:
+                raise ValueError("max_dev (0..0,05], max_slew > 0 und deadband_s >= 0 verlangt")
         if self.ring_s is None:
-            self.ring_s = self.est_window_s + self.search_max_s + self.buffer_s + 2.0
+            # Der Ring hält nur das Fenster Ausgabe..Ankunft (B plus RTT der Übergabe) und das
+            # Schätzfenster; der absolute Lag (wächst über Stunden) geht nicht ein.
+            b_max = max(self.buffer_s, self.target_buffer_s or 0.0) + self.deadband_s
+            self.ring_s = self.est_window_s + self.search_max_s + b_max + 2.0
 
 
 @dataclass(frozen=True)
@@ -71,8 +97,10 @@ class HandoffResult:
     target: str
     t_switch: int | None = None     # Umschaltpunkt in Programm-Samples
     lag_s: float | None = None      # Lag des Ziels relativ zum Programm (Schätzung oder Hinweis)
-    required_s: float | None = None  # lag + reserve
-    buffer_s: float | None = None
+    required_s: float | None = None  # lag + reserve (ohne Regelung)
+    buffer_s: float | None = None    # D bzw. aktueller Puffer B
+    buffer_after_s: float | None = None   # B nach der Übergabe (nur mit Regelung)
+    wait_s: float | None = None      # geschätzte Wartezeit bis zur Freigabe (nur mit Regelung)
 
 
 @dataclass(frozen=True)
@@ -96,6 +124,45 @@ class SourceInfo:
 
 
 @dataclass(frozen=True)
+class HandoffOutlook:
+    """Freigabe der Übergabe an eine Quelle nach dem Pufferkriterium."""
+
+    ok: bool
+    buffer_after_s: float           # erwarteter Puffer nach der Übergabe
+    lag_growth_s: float             # erwarteter Lag-Zuwachs
+    wait_s: float | None            # 0 = frei; None = mit den Reglerwerten nicht erreichbar
+
+
+@dataclass(frozen=True)
+class BufferStatus:
+    """Zustand des elastischen Ausgangs (Vorbereitung für die Oberfläche)."""
+
+    enabled: bool
+    buffer_s: float                 # B: angekommen, aber noch nicht ausgegeben
+    target_s: float | None
+    min_s: float | None
+    rate: float                     # r (Ausgabe-Tempo; < 1 = langsamer, füllt auf)
+    rate_bpm: float                 # äquivalente BPM (bpm_ref · r)
+    output_delay_s: float           # D_eff = w − T_aus (wächst mit der Summe der Lags)
+    lag_s: float                    # Lag der aktiven Quelle
+    release: bool                   # Übergabe an irgendeine Quelle nach B-Kriterium frei
+    wait_s: float | None            # kürzeste Wartezeit bis zur Freigabe (0 = frei)
+    eta_target_s: float | None      # Sekunden, bis B im Totband um das Ziel liegt
+    handoff: dict[str, HandoffOutlook] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BlockInfo:
+    """Leseposition des zuletzt verarbeiteten Ausgabeblocks (Position in Programm-Samples)."""
+
+    n: int
+    pos: float                      # Programmzeit des ersten Ausgabe-Samples
+    r0: float                       # Rate am Blockanfang
+    r1: float                       # Rate am Blockende (linearer Verlauf)
+    buffer_s: float                 # B am Blockende
+
+
+@dataclass(frozen=True)
 class MixerStatus:
     active: str | None
     previous: str | None
@@ -105,6 +172,7 @@ class MixerStatus:
     underruns: int              # Ausgabeblöcke mit noch nicht angekommenen Quelldaten
     wall_s: float
     sources: dict[str, SourceInfo] = field(default_factory=dict)
+    buffer: BufferStatus | None = None
 
 
 @dataclass
@@ -148,7 +216,14 @@ class RelayMixer:
         self._sil_thr = 10.0 ** (c.silence_db / 20.0)
         self._sil_timeout = int(c.silence_timeout_s * self.fs)
         self._rearm = int(c.rearm_silence_s * self.fs)
-        self.events: list[Event] = []
+        self.events: deque[Event] = deque(maxlen=4096)    # begrenzt: läuft über Stunden
+        self._t_blk = -self._D          # Programmzeit des Ausgabeblocks, der gerade entsteht
+        self.last_block: BlockInfo | None = None
+        self._stage: VarispeedReader | None = None
+        self._ctl: BufferController | None = None
+        if c.target_buffer_s is not None:
+            self._stage = VarispeedReader(-float(self._D))
+            self._ctl = BufferController(c.target_buffer_s, c.deadband_s, c.max_dev, c.max_slew)
 
     # ------------------------------------------------------------------ Quellen
 
@@ -161,6 +236,14 @@ class RelayMixer:
         tracker = LagTracker(gate=c.gate_s * self.fs, rate_limit=c.max_rate_ppm * 1e-6,
                              min_conf=c.min_conf)
         self._sources[name] = _Source(name, SampleRing(int(c.ring_s * self.fs)), tracker, rtt_hint_s)
+
+    def set_lag(self, name: str, lag_s: float) -> None:
+        """Lag einer Quelle von außen vorgeben (z. B. aus einer anderen Messung; ohne Audio-
+        Schätzung). Die Quelle gilt dann als eingerastet, mit Driftrate 0."""
+        s = self._get(name)
+        if s.is_reference and name == self._active:
+            raise ValueError("Lag der aktiven Quelle ist durch die Zeitachse festgelegt")
+        s.tracker.set_reference(lag_s * self.fs, float(self._wall))
 
     def set_active(self, name: str) -> None:
         """Erste Quelle aktivieren: sie definiert die Zeitachse (lag 0)."""
@@ -183,8 +266,10 @@ class RelayMixer:
     def request_handoff(self, target: str, at: float | None = None) -> HandoffResult:
         """Übergabe an ``target``: sofort (``at=None``, am Live-Rand des Programms) oder zur
         Programmzeit ``at`` (Sekunden auf der Zeitachse T). Verweigert mit Grund, wenn der
-        Lag des Ziels plus Reserve den Puffer D sprengt, die Schätzung fehlt/veraltet ist oder
-        der Zeitpunkt nicht mehr im Puffer liegt."""
+        Puffer nach dem erwarteten Lag-Zuwachs unter ``min_buffer_s`` fiele (mit Regelung; die
+        Meldung nennt die geschätzte Wartezeit) bzw. der Lag des Ziels plus Reserve den festen
+        Puffer D sprengt (ohne Regelung), die Schätzung fehlt/veraltet ist oder der Zeitpunkt
+        nicht mehr im Puffer liegt."""
         return self._handoff(target, at, commit=True)
 
     def _handoff(self, target: str, at: float | None, commit: bool) -> HandoffResult:
@@ -193,7 +278,7 @@ class RelayMixer:
         def no(reason: str, msg: str, **kw) -> HandoffResult:
             if commit:
                 self._event("handoff_refused", target=target, reason=reason)
-            return HandoffResult(False, reason, msg, target, buffer_s=c.buffer_s, **kw)
+            return HandoffResult(False, reason, msg, target, buffer_s=self._buffer_report(), **kw)
 
         if target not in self._sources:
             return no("unknown_source", f"Quelle {target!r} ist nicht registriert")
@@ -213,7 +298,20 @@ class RelayMixer:
         else:
             lag_s = None
             src = ""
-        if lag_s is not None and lag_s + c.reserve_s > c.buffer_s:
+        if self._ctl is not None and lag_s is not None:
+            out = self._outlook(lag_s)
+            if not out.ok:
+                b_now = self.buffer_s
+                if out.wait_s is None:
+                    when = "mit den Reglerwerten nicht erreichbar"
+                else:
+                    when = f"voraussichtlich frei in {out.wait_s:.0f} s"
+                return no("buffer_too_low",
+                          f"Puffer {b_now:.2f} s: nach der Übergabe an {target!r} (Lag +"
+                          f"{out.lag_growth_s * 1e3:.0f} ms, {src}) blieben {out.buffer_after_s:.2f} s, "
+                          f"Untergrenze {c.min_buffer_s:.2f} s; {when}",
+                          lag_s=lag_s, buffer_after_s=out.buffer_after_s, wait_s=out.wait_s)
+        elif lag_s is not None and lag_s + c.reserve_s > c.buffer_s:
             return no("rtt_exceeds_buffer",
                       f"Lag von {target!r} ({lag_s * 1e3:.0f} ms, {src}) plus Reserve "
                       f"({c.reserve_s * 1e3:.0f} ms) übersteigt den Puffer D = {c.buffer_s * 1e3:.0f} ms",
@@ -227,7 +325,7 @@ class RelayMixer:
                       lag_s=lag_s)
         if s.silence_run >= self._sil_timeout:
             return no("target_silent", f"{target!r} liefert gerade Stille", lag_s=lag_s)
-        t_next_out = self._wall - self._D
+        t_next_out = self.output_time
         if at is None:
             t_sw = int(round(self._wall - act_lag))      # Live-Rand des Programms
         else:
@@ -242,9 +340,10 @@ class RelayMixer:
             self._fallback = False
             self._event("handoff_scheduled", target=target, t_switch=t_sw, lag_s=lag_s)
             self._update_active()
+        after = self._outlook(lag_s).buffer_after_s if self._ctl is not None else None
         return HandoffResult(True, "ok", "Übergabe vorgemerkt" if commit else "Übergabe möglich",
                              target, t_switch=t_sw, lag_s=lag_s, required_s=lag_s + c.reserve_s,
-                             buffer_s=c.buffer_s)
+                             buffer_s=self._buffer_report(), buffer_after_s=after)
 
     # ------------------------------------------------------------------ Verarbeitung
 
@@ -271,9 +370,27 @@ class RelayMixer:
         if self._wall >= self._next_est:
             self._run_estimators()
             self._next_est = self._wall + int(self.cfg.est_hop_s * self.fs)
-        self._check_fallback(n)
-        out = self._compose(w0 - self._D, n, count=True).astype(np.float32)
+        if self._stage is None:
+            self._t_blk = w0 - self._D
+            self._check_fallback(n)
+            out = self._compose(self._t_blk, n, count=True).astype(np.float32)
+        else:
+            self._t_blk = self._stage.pos_int
+            self._check_fallback(n)
+            out = self._render_elastic(n).astype(np.float32)
         self._prune()
+        return out
+
+    def _render_elastic(self, n: int) -> np.ndarray:
+        """Ausgabeblock mit geregelter Rate; ohne aktive Quelle bleibt die Rate 1."""
+        st, ctl = self._stage, self._ctl
+        pos = st.position
+        r0 = 1.0 + ctl.dev
+        if self._active is not None:
+            ctl.step(self._buffer_at(pos + st.advance_of(n, r0, r0)), n / self.fs)
+        r1 = 1.0 + ctl.dev
+        out = st.render(lambda t0, m: self._compose(t0, m, count=True), n, r0, r1)
+        self.last_block = BlockInfo(n, pos, r0, r1, self._buffer_at(st.position))
         return out
 
     def read_program(self, t0: int, n: int, source: str | None = None) -> np.ndarray:
@@ -284,6 +401,12 @@ class RelayMixer:
         seinen Übergang mischt; das Programm selbst käme nach der Übergabe aus seinem eigenen
         Feed (Rückkopplung). Was noch nicht angekommen ist, kommt als Null."""
         return self._compose(int(t0), int(n), count=False, only=source)
+
+    def read_feed(self, source: str, w0: int, n: int) -> np.ndarray:
+        """Roh-Feed einer Quelle nach Wanduhr-Index ``[w0, w0+n)`` (kein Lag, keine Resampling-
+        Korrektur). So kommt der Rückkanal beim DJ an: die abgebende Quelle wird unverändert zurück-
+        geschickt; was noch nicht angekommen oder schon überschrieben ist, kommt als Null."""
+        return self._get(source).ring.read(int(w0), int(n))
 
     # ------------------------------------------------------------------ Auskunft
 
@@ -298,8 +421,85 @@ class RelayMixer:
 
     @property
     def output_time(self) -> int:
-        """Programmzeit des nächsten Ausgabe-Samples (= w − D)."""
-        return self._wall - self._D
+        """Programmzeit des nächsten Ausgabe-Samples (ohne Regelung = w − D)."""
+        if self._stage is None:
+            return self._wall - self._D
+        return self._stage.pos_int
+
+    @property
+    def output_position(self) -> float:
+        """Wie ``output_time``, aber mit Bruchteil (Samples)."""
+        if self._stage is None:
+            return float(self._wall - self._D)
+        return self._stage.position
+
+    @property
+    def rate(self) -> float:
+        """Aktuelles Ausgabe-Tempo r (1 = Echtzeit; < 1 = langsamer, der Puffer füllt sich)."""
+        return 1.0 + self._ctl.dev if self._ctl is not None else 1.0
+
+    @property
+    def buffer_s(self) -> float:
+        """Puffer B in Sekunden: Live-Rand der aktiven Quelle minus Ausgabeposition."""
+        return self._buffer_at(self.output_position)
+
+    def _buffer_at(self, pos: float) -> float:
+        lag = self.lag_of(self._active) if self._active else 0.0
+        return (self._wall - lag - pos) / self.fs
+
+    def _buffer_report(self) -> float:
+        return self.buffer_s if self._ctl is not None else self.cfg.buffer_s
+
+    def _outlook(self, lag_target_s: float) -> HandoffOutlook:
+        """Pufferkriterium für eine Übergabe an eine Quelle mit Lag ``lag_target_s`` (absolut):
+        Puffer danach = Live-Rand mit neuem Lag minus Ausgabeposition ≥ ``min_buffer_s``."""
+        c = self.cfg
+        after = self._buffer_at_lag(lag_target_s)
+        growth = lag_target_s - (self.lag_of(self._active) / self.fs if self._active else 0.0)
+        if after >= c.min_buffer_s:
+            return HandoffOutlook(True, after, growth, 0.0)
+        # nötiger Puffer jetzt, damit nach dem Zuwachs min_buffer_s bleibt
+        need = self.buffer_s + (c.min_buffer_s - after)
+        return HandoffOutlook(False, after, growth,
+                              self._ctl.time_to(self.buffer_s, need))
+
+    def _buffer_at_lag(self, lag_s: float) -> float:
+        return (self._wall - lag_s * self.fs - self.output_position) / self.fs
+
+    def _expected_lag_s(self, s: _Source) -> float | None:
+        if s.tracker.locked:
+            return s.tracker.predict(self._wall) / self.fs
+        if s.rtt_hint_s is not None:
+            return (self.lag_of(self._active) if self._active else 0.0) / self.fs + s.rtt_hint_s
+        return None
+
+    def _buffer_status(self) -> BufferStatus:
+        c = self.cfg
+        lag = self.lag_of(self._active) / self.fs if self._active else 0.0
+        r = self.rate
+        b = self.buffer_s
+        delay = (self._wall - self.output_position) / self.fs
+        if self._ctl is None:
+            return BufferStatus(False, b, None, None, 1.0, c.bpm_ref, delay, lag,
+                                release=False, wait_s=None, eta_target_s=None)
+        pending = self._segments[-1].src if self._segments else None
+        outlooks: dict[str, HandoffOutlook] = {}
+        for name, s in self._sources.items():
+            if name == self._active or name == pending:
+                continue
+            lag_t = self._expected_lag_s(s)
+            if lag_t is not None:
+                outlooks[name] = self._outlook(lag_t)
+        waits = [o.wait_s for o in outlooks.values() if o.wait_s is not None]
+        wait = min(waits) if waits else None
+        if abs(b - c.target_buffer_s) <= (self._ctl.rest_s if self._ctl.engaged else c.deadband_s):
+            eta = 0.0
+        else:
+            lo, hi = self._ctl.reach_limits()
+            eta = self._ctl.time_to(b, lo if b < c.target_buffer_s else hi)
+        return BufferStatus(True, b, c.target_buffer_s, c.min_buffer_s, r, c.bpm_ref * r, delay,
+                            lag, release=any(o.ok for o in outlooks.values()), wait_s=wait,
+                            eta_target_s=eta, handoff=outlooks)
 
     def lag_of(self, name: str, wall: float | None = None) -> float:
         """Lag der Quelle in Samples (Schätzung, mit Drift fortgeschrieben)."""
@@ -331,7 +531,8 @@ class RelayMixer:
             active=self._active, previous=self._previous, no_source=self._active is None,
             silent=silent, fallback=self._fallback, underruns=self._underruns,
             wall_s=self._wall / self.fs,
-            sources={k: self.source_info(k) for k in self._sources})
+            sources={k: self.source_info(k) for k in self._sources},
+            buffer=self._buffer_status())
 
     # ------------------------------------------------------------------ intern
 
@@ -360,7 +561,7 @@ class RelayMixer:
                 s.is_reference = False
         s.silence_run = n - 1 - int(loud[-1])
         s.had_signal = True
-        s.level_db = 20.0 * np.log10(float(np.sqrt(np.mean(np.square(blk, dtype=np.float64)))) + 1e-12)
+        s.level_db = 20.0 * np.log10(float(np.sqrt(float(blk.dot(blk)) / n)) + 1e-12)
 
     def _lag_params(self, s: _Source) -> tuple[float, float, float]:
         return s.tracker.lag, s.tracker.rate, s.tracker.t_ref
@@ -429,7 +630,7 @@ class RelayMixer:
             self._event("handoff_effective", source=nxt.src, previous=old, t_switch=nxt.t_start)
 
     def _prune(self) -> None:
-        horizon = self._wall - self._D - int(self.cfg.ring_s * self.fs)
+        horizon = self._t_blk - int(self.cfg.ring_s * self.fs)
         while len(self._segments) > 1 and \
                 self._segments[1].t_start + self._segments[1].fade < horizon:
             self._segments.pop(0)
@@ -477,7 +678,7 @@ class RelayMixer:
             hi = int(np.ceil(pred + s.tracker.gate))
         else:
             lo = int(np.ceil(act_lag + c.min_rtt_s * fs))
-            hi = int(c.search_max_s * fs)
+            hi = int(np.ceil(act_lag + c.search_max_s * fs))
         lo = max(lo, 1)
         if hi - lo < 16:
             return
@@ -514,7 +715,7 @@ class RelayMixer:
         t_sil = w_sil - self.lag_of(a, w_sil)
         # Der Crossfade soll enden, wo die Quelle verstummt ist: Beginn eine Fade-Länge früher,
         # soweit der Ausgabe-Rand es noch erlaubt (der Puffer D macht das rückwirkend möglich).
-        t_sw = max(int(t_sil) - self._fade, self._wall - n - self._D, self._segments[-1].t_start)
+        t_sw = max(int(t_sil) - self._fade, self._t_blk, self._segments[-1].t_start)
         self._segments.append(_Segment(t_sw, prev.name, self._fade))
         self._fallback = True
         self._silent_flag = False

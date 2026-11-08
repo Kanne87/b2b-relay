@@ -77,18 +77,23 @@ def frac_read(buf: np.ndarray, pos: np.ndarray) -> np.ndarray:
     """4-Punkt-Lagrange-Interpolation von ``buf`` an Positionen ``pos`` (Index im Array).
 
     Positionen ohne vollständige Nachbarschaft (``<1`` oder ``>len-3``) ergeben 0.
-    Bei ganzzahliger Position ist das Ergebnis exakt der Arraywert.
+    Bei ganzzahliger Position ist das Ergebnis exakt der Arraywert. (Farrow-Form.)
     """
     pos = np.asarray(pos, dtype=np.float64)
-    i = np.floor(pos).astype(np.int64)
-    f = pos - i
-    ok = (i >= 1) & (i <= buf.shape[0] - 3)
-    ic = np.clip(i, 1, buf.shape[0] - 3)
     if buf.shape[0] < 4:
         return np.zeros(pos.shape, dtype=np.float64)
-    c_m1 = -f * (f - 1.0) * (f - 2.0) / 6.0
-    c_0 = (f + 1.0) * (f - 1.0) * (f - 2.0) / 2.0
-    c_1 = -(f + 1.0) * f * (f - 2.0) / 2.0
-    c_2 = (f + 1.0) * f * (f - 1.0) / 6.0
-    y = (c_m1 * buf[ic - 1] + c_0 * buf[ic] + c_1 * buf[ic + 1] + c_2 * buf[ic + 2])
-    return np.where(ok, y, 0.0)
+    i = np.floor(pos).astype(np.intp)
+    f = pos - i
+    ok = (i >= 1) & (i <= buf.shape[0] - 3)
+    all_ok = bool(ok.all())
+    if not all_ok:
+        i = np.clip(i, 1, buf.shape[0] - 3)
+    a = buf[i - 1].astype(np.float64)
+    b = buf[i].astype(np.float64)
+    c = buf[i + 1].astype(np.float64)
+    d = buf[i + 2].astype(np.float64)
+    c1 = c - b * 0.5 - a * (1.0 / 3.0) - d * (1.0 / 6.0)
+    c2 = (a + c) * 0.5 - b
+    c3 = (b - c) * 0.5 + (d - a) * (1.0 / 6.0)
+    y = b + f * (c1 + f * (c2 + f * c3))
+    return y if all_ok else np.where(ok, y, 0.0)

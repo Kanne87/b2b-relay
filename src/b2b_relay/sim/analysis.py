@@ -115,3 +115,29 @@ def max_sample_jump(x: np.ndarray, exclude: np.ndarray | None = None) -> float:
     if exclude is not None and len(exclude):
         d = np.where(exclude[1:] | exclude[:-1], 0.0, d)
     return float(d.max())
+
+
+def find_gaps_chunked(x: np.ndarray, fs: int, min_ms: float = 5.0, thr: float = 2e-5,
+                      chunk: int = 1 << 22) -> list[tuple[int, int]]:
+    """Wie ``find_gaps``, aber blockweise (Temporärspeicher unabhängig von der Länge von ``x``)."""
+    out: list[tuple[int, int]] = []
+    min_len = int(min_ms * 1e-3 * fs)
+    run_start: int | None = None        # Beginn eines Laufs, der über die Blockgrenze reicht
+    for c0 in range(0, len(x), chunk):
+        quiet = np.abs(x[c0:c0 + chunk]) < thr
+        d = np.diff(np.concatenate(([0], quiet.astype(np.int8), [0])))
+        starts = np.flatnonzero(d == 1) + c0
+        ends = np.flatnonzero(d == -1) + c0
+        if run_start is not None:
+            if len(starts) and starts[0] == c0:
+                starts[0] = run_start            # Lauf setzt sich fort
+            else:
+                out.append((run_start, c0 - run_start))
+            run_start = None
+        if len(ends) and len(starts) and ends[-1] == min(c0 + chunk, len(x)) and c0 + chunk < len(x):
+            run_start = int(starts[-1])
+            starts, ends = starts[:-1], ends[:-1]
+        out.extend((int(a), int(b - a)) for a, b in zip(starts, ends))
+    if run_start is not None:
+        out.append((run_start, len(x) - run_start))
+    return [(a, ln) for a, ln in out if ln >= min_len]

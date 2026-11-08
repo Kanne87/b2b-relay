@@ -29,6 +29,8 @@ class PlanConfig:
     human_error_ms: float = 5.0
     seed: int = 1
     fs: int = 48000
+    min_gap_s: float = 0.0        # Mindestabstand zwischen zwei Übergaben (verlängert die Haltezeit)
+    track_pool: int = 8           # so viele verschiedene Tracks werden gerendert und wiederverwendet
 
 
 @dataclass
@@ -40,7 +42,6 @@ class PTrack:
     human_s: float = 0.0
     mix_bars: int = 0             # Länge der Einblendung
     nominal_start: float = 0.0    # Taktlinie ohne menschlichen Fehler
-    track: Track | None = field(default=None, repr=False)
     nxt: "PTrack | None" = field(default=None, repr=False)
     mute_at: float | None = None  # Programmzeit, ab der der DJ ausblendet (nach Übergabe)
 
@@ -63,7 +64,18 @@ class Plan:
         self.bar = bar_samples(cfg.fs)
         self.tracks: list[PTrack] = []
         self.handoffs: list[PHandoff] = []
+        self._cache: dict[int, Track] = {}
         self._build()
+
+    def track_of(self, t: PTrack) -> Track:
+        """Gerenderter Track; nur ``track_pool`` verschiedene Seeds (aufeinanderfolgende Tracks
+        sind verschieden), damit lange Läufe keinen Speicher für hunderte Tracks brauchen."""
+        key = t.idx % self.cfg.track_pool
+        tr = self._cache.get(key)
+        if tr is None:
+            tr = self._cache[key] = Track(seed=self.cfg.seed * 1000 + key, bars=self.bars_needed,
+                                          fs=self.fs)
+        return tr
 
     def swap_point(self, t: PTrack) -> float:
         return t.start + 0.5 * t.mix_bars * self.bar
@@ -72,6 +84,10 @@ class Plan:
         cfg, bar = self.cfg, self.bar
         rng = np.random.default_rng([cfg.seed, 7])
         N, H = cfg.mix_bars, cfg.hold_bars
+        # Abstand zweier Übergaben: 2 eigene Übergänge (N+H Takte je) + N+1+arm Takte
+        need = cfg.min_gap_s * cfg.fs / bar - (3 * N + 1 + cfg.arm_bars)
+        H = max(H, int(np.ceil(need / 2.0)))
+        self.hold_bars = H
 
         def delta() -> float:
             return float(rng.uniform(-1.0, 1.0)) * cfg.human_error_ms * 1e-3
@@ -100,9 +116,7 @@ class Plan:
             cur = new
             active = other
         self.t_end = cur.start + (N + 4) * bar + 4 * self.fs
-        bars_needed = 3 * N + 2 * H + cfg.arm_bars + 8
-        for i, t in enumerate(self.tracks):
-            t.track = Track(seed=cfg.seed * 1000 + i, bars=bars_needed, fs=self.fs)
+        self.bars_needed = 3 * N + 2 * H + cfg.arm_bars + 8
 
     def own_gains(self, t: PTrack, T: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(low, high)-Gains eines Tracks im Master seines DJs (ohne Rückkanal-Anteil)."""

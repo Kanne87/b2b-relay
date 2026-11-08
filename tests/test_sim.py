@@ -4,7 +4,8 @@ import wave
 import numpy as np
 
 from b2b_relay.sim.__main__ import main
-from b2b_relay.sim.analysis import find_gaps, kick_phase_errors, max_sample_jump, onset_shift
+from b2b_relay.sim.analysis import (find_gaps, find_gaps_chunked, kick_phase_errors, max_sample_jump,
+                                    onset_shift)
 from b2b_relay.sim.plan import Plan, PlanConfig
 from b2b_relay.sim.synth import Track, beat_samples
 from b2b_relay.sim.transport import Link
@@ -77,6 +78,7 @@ def test_cli_end_to_end(tmp_path, capsys):
     rep_path, wav_path = tmp_path / "r.json", tmp_path / "p.wav"
     rc = main(["--handoffs", "2", "--mix-bars", "4", "--rtt-a-ms", "60", "--rtt-b-ms", "220",
                "--jitter-ms", "12", "--loss", "0.001", "--drift-ppm", "50", "--seed", "2",
+               "--target-buffer-s", "0", "--min-gap-s", "0",
                "--out", str(rep_path), "--wav", str(wav_path), "--quiet"])
     rep = json.loads(rep_path.read_text())
     assert rc == 0, rep["summary"]
@@ -90,3 +92,50 @@ def test_cli_end_to_end(tmp_path, capsys):
     with wave.open(str(wav_path)) as w:
         assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 48000)
         assert w.getnframes() > 40 * 48000
+
+
+def test_cli_elastic_output_end_to_end(tmp_path):
+    """Mit Regelung: Puffer/Rate/Zuschauer-Verzögerung im Report, Messungen in Programmzeit."""
+    rep_path = tmp_path / "r.json"
+    rc = main(["--handoffs", "2", "--mix-bars", "4", "--rtt-a-ms", "40", "--rtt-b-ms", "250",
+               "--jitter-ms", "12", "--loss", "0.001", "--drift-ppm", "50", "--seed", "2",
+               "--buffer-s", "2.9", "--target-buffer-s", "3", "--max-dev", "0.005",
+               "--min-gap-s", "0", "--settle-s", "60", "--out", str(rep_path), "--quiet"])
+    rep = json.loads(rep_path.read_text())
+    assert rc == 0, (rep["summary"], rep["acceptance"])
+    acc = rep["acceptance"]
+    for key in ("buffer_never_below_min", "viewer_delay_below_4s", "rate_within_max_dev",
+                "buffer_ends_near_target", "no_unexplained_gap_over_5ms", "beat_phase_below_3ms"):
+        assert acc[key], key
+    assert rep["buffer"]["min_s"] >= 1.0 and rep["rate"]["max_abs_dev"] <= 0.005 + 1e-9
+    assert rep["viewer_delay"]["max_s"] < 4.0 and rep["series"]
+    for h in rep["handoffs"]:
+        assert h["accepted"] and h["buffer_after_expected_s"] >= 1.0
+        assert abs(h["beat_phase_error_max_abs_ms"]) < 3.0 and h["gaps_unexplained"] == 0
+
+
+def test_plan_min_gap_stretches_hold_time():
+    p0 = Plan(PlanConfig(handoffs=3, seed=3))
+    p60 = Plan(PlanConfig(handoffs=3, seed=3, min_gap_s=60.0))
+    gaps = [b.t_h - a.t_h for a, b in zip(p60.handoffs, p60.handoffs[1:])]
+    assert all(g / FS >= 60.0 for g in gaps)
+    assert p60.hold_bars > p0.hold_bars
+    # Tracks kommen aus einem kleinen Pool (kein Speicher für hunderte Tracks)
+    big = Plan(PlanConfig(handoffs=30, seed=1, min_gap_s=60.0))
+    assert len(big.tracks) == 91
+    for t in big.tracks:
+        big.track_of(t)
+    assert len(big._cache) == 8
+    assert big.track_of(big.tracks[0]) is not big.track_of(big.tracks[1])
+
+
+def test_chunked_gap_search_equals_plain_search():
+    rng = np.random.default_rng(0)
+    for t in range(60):
+        x = rng.standard_normal(5000) * 0.1
+        for _ in range(int(rng.integers(0, 8))):
+            a = int(rng.integers(0, 5000))
+            x[a:a + int(rng.integers(1, 900))] = 0
+        if t % 3 == 0:
+            x[:int(rng.integers(0, 500))] = 0
+        assert find_gaps(x, FS) == find_gaps_chunked(x, FS, chunk=int(rng.integers(300, 1200)))

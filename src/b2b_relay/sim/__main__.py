@@ -25,6 +25,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="menschlicher Fehler beim Einstarten (±, gleichverteilt)")
     ap.add_argument("--mix-bars", type=int, default=8, help="Länge einer Überblendung in Takten")
     ap.add_argument("--buffer-s", type=float, default=2.0, help="Ausgabepuffer D in Sekunden")
+    ap.add_argument("--target-buffer-s", type=float, default=3.0,
+                    help="Zielpuffer des elastischen Ausgangs in s (Standard 3,0); 0 = fester Puffer "
+                         "--buffer-s wie in Scheibe 1")
+    ap.add_argument("--min-buffer-s", type=float, default=1.0, help="Untergrenze B_min nach einer Übergabe")
+    ap.add_argument("--max-dev", type=float, default=0.005,
+                    help="größte Abweichung |r−1| des Ausgabe-Tempos (Standard 0,005 = 0,5 %%)")
+    ap.add_argument("--max-slew", type=float, default=0.001, help="größte Änderung von r je Sekunde")
+    ap.add_argument("--deadband-s", type=float, default=0.1, help="Totband des Reglers (± s)")
+    ap.add_argument("--min-gap-s", type=float, default=60.0, help="Mindestabstand zwischen Übergaben in s")
+    ap.add_argument("--settle-s", type=float, default=90.0,
+                    help="Nachlauf nach dem Programmende, damit der Puffer ausregeln kann")
     ap.add_argument("--reserve-ms", type=float, default=300.0)
     ap.add_argument("--fade-ms", type=float, default=100.0, help="Crossfade der Übergabe (50–200)")
     ap.add_argument("--block", type=int, default=512, help="Blockgröße in Samples")
@@ -36,7 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = SimConfig(handoffs=a.handoffs, rtt_a_ms=a.rtt_a_ms, rtt_b_ms=a.rtt_b_ms,
                     jitter_ms=a.jitter_ms, loss=a.loss, drift_ppm=a.drift_ppm, seed=a.seed,
                     human_error_ms=a.human_error_ms, mix_bars=a.mix_bars, buffer_s=a.buffer_s,
-                    reserve_ms=a.reserve_ms, fade_ms=a.fade_ms, block=a.block)
+                    reserve_ms=a.reserve_ms, fade_ms=a.fade_ms, block=a.block,
+                    target_buffer_s=a.target_buffer_s, min_buffer_s=a.min_buffer_s, max_dev=a.max_dev,
+                    max_slew=a.max_slew, deadband_s=a.deadband_s, min_gap_s=a.min_gap_s,
+                    settle_s=a.settle_s)
     log = None if a.quiet else (lambda m: print(m, file=sys.stderr, flush=True))
     rep = run(cfg, keep_program=bool(a.wav), log=log)
     prog = rep.pop("_program", None)
@@ -50,7 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Übergaben {s['handoffs_accepted']}/{s['handoffs_planned']}  "
           f"RTT-Fehler max {s['max_abs_rtt_error_ms']} ms  "
           f"Beat-Phase max {s['max_abs_beat_phase_error_ms']} ms  "
-          f"Lücken unerklärt {s['gaps_unexplained']}  Laufzeit {s['runtime_s']} s  "
+          f"Lücken unerklärt {s['gaps_unexplained']}  "
+          f"Puffer {s['buffer_min_s']:.2f}..{s['buffer_max_s']:.2f} s (Ende {s['buffer_final_s']:.2f})  "
+          f"Rate {s['rate_min']:.4f}..{s['rate_max']:.4f}  "
+          f"Zuschauer-Verzögerung max {s['viewer_delay_max_s']:.2f} s  Laufzeit {s['runtime_s']} s  "
           f"-> {'BESTANDEN' if acc['passed'] else 'NICHT BESTANDEN'}")
     return 0 if acc["passed"] else 1
 
