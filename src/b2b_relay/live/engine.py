@@ -16,6 +16,7 @@ eine Befehlsschlange (``call``) und lesen den zuletzt veröffentlichten Status (
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -96,6 +97,10 @@ class Engine:
         self._last_active: str | None = None
         self._last_label = ""
         self._wav: WavWriter | None = None
+        self._trace: Any = None                         # JSON-Lines neben dem Mitschnitt (Auswertung)
+        self._trace_frames = 0                          # Frames, die in den Mitschnitt geschrieben sind
+        self._retime_total = 0                          # Summe aller Umlabel-Schritte (Samples)
+        self._last_event: Any = None
         self.load = 0.0                                 # Rechenzeit / Blockdauer (geglättet)
         self.chunks = 0
         self.last_error: str | None = None
@@ -143,7 +148,8 @@ class Engine:
 
     def _set_first(self, name: str) -> None:
         self.master.set_active(name)
-        self.master.retime(-self._base)         # Vorlauf: alle Lags bleiben positiv (±drift_base_s Regelweg)
+        self.master.retime(-self._base)
+        self._retime_total += -self._base       # Vorlauf: alle Lags bleiben positiv (±drift_base_s Regelweg)
         self._last_active = name
 
     def handover(self, to: str) -> dict:
@@ -176,6 +182,9 @@ class Engine:
         if self._wav:
             self._wav.close()
             self._wav = None
+        if self._trace:
+            self._trace.close()
+            self._trace = None
 
     def _open_record(self) -> None:
         if not self.cfg.record_dir:
@@ -184,6 +193,8 @@ class Engine:
         d.mkdir(parents=True, exist_ok=True)
         self._last_label = str(d / datetime.now().strftime("program-%Y%m%d-%H%M%S.wav"))
         self._wav = WavWriter(self._last_label, self.fs, 2, self.cfg.record_format)
+        self._trace = open(self._last_label[:-4] + ".trace.jsonl", "w", buffering=1)
+        self._trace_frames = 0
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -261,6 +272,8 @@ class Engine:
         left, right = m + s, m - s
         if self._wav:
             self._wav.write((left, right))
+            if self._trace:
+                self._write_trace(k)
         self.program.write((left, right), k)
         self.proc += k
         self.chunks += 1
@@ -269,6 +282,32 @@ class Engine:
         if now >= self._next_snap:
             self._next_snap = now + 0.25
             self._publish()
+
+    def _write_trace(self, k: int) -> None:
+        """Eine Zeile je Block: Mitschnitt-Index → Programmzeit (ohne Umlabeln, "Inhaltszeit"), Rate, Puffer;
+        dazu neue Mixer-Ereignisse. Grundlage für ``tests/integration/analyze.py``."""
+        m = self.master
+        lb = m.last_block
+        if lb is not None:
+            rec = {"k": "blk", "i": self._trace_frames, "n": k, "Tc": lb.pos - self._retime_total,
+                   "r0": round(lb.r0, 6), "r1": round(lb.r1, 6), "b": round(lb.buffer_s, 4),
+                   "wall": m.wall, "drift_ms": round(self.drift.status().drift_ms, 3),
+                   "xr": self.rt.xruns}
+            self._trace.write(json.dumps(rec) + "\n")
+        evs = list(m.events)
+        new = []
+        for e in reversed(evs):
+            if e is self._last_event:
+                break
+            new.append(e)
+        if evs:
+            self._last_event = evs[-1]
+        for e in reversed(new):
+            rec = {"k": "ev", "i": self._trace_frames, "wall": e.wall, "kind": e.kind, **e.detail}
+            if "t_switch" in rec:
+                rec["Tc_switch"] = rec["t_switch"] - self._retime_total
+            self._trace.write(json.dumps(rec, default=str) + "\n")
+        self._trace_frames += k
 
     def _drift_step(self, k: int) -> None:
         st = self.master.status
@@ -286,6 +325,7 @@ class Engine:
         d = self.drift.step(self.master.live_edge, mono, k / self.fs)
         if d:
             self.master.retime(d)
+            self._retime_total += d
 
     # ------------------------------------------------------------------ Status
 
