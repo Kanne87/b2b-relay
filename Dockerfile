@@ -19,7 +19,7 @@ WORKDIR /src/jacktrip
 RUN meson setup builddir --buildtype=release -Dnogui=true -Dnovs=true -Dnooscpp=true -Dnoupdater=true \
       -Drtaudio=disabled -Dlibsamplerate=disabled -Dqtversion=6 \
     && ninja -C builddir \
-    && install -D build/jacktrip /out/usr/local/bin/jacktrip
+    && install -D builddir/jacktrip /out/usr/local/bin/jacktrip
 
 FROM ${UBUNTU} AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
