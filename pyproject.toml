@@ -5,14 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "b2b-relay"
 version = "0.1.0"
-description = "Relay-Mixer für Online-Back-to-Back von DJs mit absichtlicher Latenz (Scheibe 1: Kern + Offline-Simulation)"
+description = "Relay-Mixer für Online-Back-to-Back von DJs mit absichtlicher Latenz (Kern, Simulation, Live-Server)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 sim = ["scipy>=1.11"]
-dev = ["pytest>=8", "scipy>=1.11"]
+live = ["JACK-Client>=0.5.4", "fastapi>=0.110", "uvicorn>=0.29"]
+dev = ["pytest>=8", "scipy>=1.11", "fastapi>=0.110", "httpx>=0.27", "uvicorn>=0.29", "JACK-Client>=0.5.4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -20,4 +21,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = ["slow: länger laufende Tests (mehrere Sekunden bis Minuten)"]
+markers = [
+    "slow: länger laufende Tests (mehrere Sekunden bis Minuten)",
+    "integration: braucht Docker (tests/integration), läuft nicht in der Unit-Test-Runde",
+]

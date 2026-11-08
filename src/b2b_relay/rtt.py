@@ -115,6 +115,14 @@ class LagTracker:
     def predict(self, t: float) -> float:
         return self.lag + self.rate * (t - self.t_ref)
 
+    def shift(self, d: float) -> None:
+        """Programmzeit umlabeln (T' = T + d): jeder Lag sinkt um ``d``, auch die gemerkten Messungen."""
+        self.lag -= d
+        self._hist = [(t, x - d) for t, x in self._hist]
+        self._outliers = [(t, x - d) for t, x in self._outliers]
+        if self._cand is not None:
+            self._cand = (self._cand[0], self._cand[1] - d)
+
     def lag_and_rate(self) -> tuple[float, float, float]:
         return self.lag, self.rate, self.t_ref
 
