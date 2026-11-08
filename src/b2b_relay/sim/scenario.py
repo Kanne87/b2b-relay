@@ -177,7 +177,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
 
         swap = plan.swap_point(new)
         kt = old.track.kick_times + old.start
-        post_k = kt[(kt > ho.t_h + fade + 0.25 * fs) & (kt < swap - 0.15 * fs)][:6]
+        post_k = kt[(kt > ho.t_h + fade + 0.25 * fs) & (kt < swap - 0.15 * fs)][:10]
         pre_k = kt[(kt > ho.t_h - 2.5 * fs) & (kt < ho.t_h - 0.15 * fs)][-4:]
         pad = int(0.35 * fs)
 
@@ -202,7 +202,7 @@ def run(cfg: SimConfig, *, keep_program: bool = False, log=None) -> dict:
                                       "skipped_loss": sum(1 for r in pre + post if r.get("lost"))}
         # neuer Track nach dem Bass-Swap: menschlicher Fehler + Relay-Anteil
         kn = new.track.kick_times + new.start
-        new_k = kn[(kn > swap + 0.15 * fs) & (kn < swap + 4 * plan.bar)][:6]
+        new_k = kn[(kn > swap + 0.15 * fs) & (kn < swap + 4 * plan.bar)][:10]
         newr = errs(new_k, ref_new)
         new_v = [r["err_ms"] for r in newr if r["ok"]]
         rep["beat_kicks"]["new_track"] = newr

@@ -25,7 +25,7 @@ def _next_pow2(n: int) -> int:
     return 1 << max(4, (int(n) - 1).bit_length())
 
 
-def gcc_phat(x: np.ndarray, p: np.ndarray, max_shift: int, *, beta: float = 0.85,
+def gcc_phat(x: np.ndarray, p: np.ndarray, max_shift: int, *, beta: float = 1.0,
              exclude: int = 48) -> DelayMeasurement | None:
     """Versatz von ``x`` gegen ``p`` per generalisierter Kreuzkorrelation mit PHAT-Gewichtung.
 

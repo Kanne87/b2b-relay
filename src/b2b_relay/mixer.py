@@ -169,7 +169,7 @@ class RelayMixer:
             raise RuntimeError("set_active ist nur für die erste Quelle; danach request_handoff")
         s.tracker.set_reference(0.0, float(self._wall))
         s.is_reference = True
-        self._cur_seg = _Segment(self._wall, name, 1)
+        self._cur_seg = _Segment(self._wall - 1, name, 1)
         self._segments.append(self._cur_seg)
         self._active = name
         self._event("active_set", source=name)
@@ -512,7 +512,9 @@ class RelayMixer:
             return
         w_sil = self._wall - s.silence_run
         t_sil = w_sil - self.lag_of(a, w_sil)
-        t_sw = max(int(t_sil), self._wall - n - self._D, self._segments[-1].t_start)
+        # Der Crossfade soll enden, wo die Quelle verstummt ist: Beginn eine Fade-Länge früher,
+        # soweit der Ausgabe-Rand es noch erlaubt (der Puffer D macht das rückwirkend möglich).
+        t_sw = max(int(t_sil) - self._fade, self._wall - n - self._D, self._segments[-1].t_start)
         self._segments.append(_Segment(t_sw, prev.name, self._fade))
         self._fallback = True
         self._silent_flag = False
