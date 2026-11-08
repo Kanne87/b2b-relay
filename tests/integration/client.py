@@ -152,15 +152,22 @@ class Dj:
     def _connect(self) -> None:
         deadline = time.time() + 60
         while time.time() < deadline:
-            rx = self.c.get_ports("JackTrip:receive_", is_audio=True, is_output=True)
-            tx = self.c.get_ports("JackTrip:send_", is_audio=True, is_input=True)
+            # Namensunabhängig: im Hub-Client-Modus heißt der lokale JackTrip-Client nicht verlässlich
+            # "JackTrip" – jeder fremde Client mit receive_/send_-Ports ist JackTrip (S3788).
+            # JACK-Muster sind POSIX-ERE – [0-9] statt \\d (vgl. PR #5).
+            own = self.c.name + ":"
+            rx = [p for p in self.c.get_ports(r":receive_[0-9]+$", is_audio=True, is_output=True)
+                  if not p.name.startswith(own)]
+            tx = [p for p in self.c.get_ports(r":send_[0-9]+$", is_audio=True, is_input=True)
+                  if not p.name.startswith(own)]
             if len(rx) >= 2 and len(tx) >= 2:
                 for k in range(2):
                     self.c.connect(rx[k], self.i[k])
                     self.c.connect(self.o[k], tx[k])
                 return
             time.sleep(0.5)
-        raise SystemExit("JackTrip-Ports nicht erschienen")
+        names = [p.name for p in self.c.get_ports()]
+        raise SystemExit(f"JackTrip-Ports nicht erschienen; vorhandene Ports: {names}")
 
 
 if __name__ == "__main__":
