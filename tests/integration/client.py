@@ -37,6 +37,9 @@ class DjCore:
     def __init__(self, name: str) -> None:
         self.name = name
         self.kick = sg.kick(name)
+        # Schwellendurchgang liegt einige Samples nach dem Kick-Anfang: so viel früher einsetzen, damit der
+        # eigene Onset auf dem gehörten Onset liegt (das Raster ``grid`` ist aus Onsets bestimmt)
+        self.onset_delay = float(sg.detect_onsets(np.concatenate([np.zeros(64, np.float32), self.kick]))[0] - 64)
         self.frames = 0                                  # globaler Frame-Zähler (Beginn des Callbacks)
         self.ring = np.zeros(10 * FS, np.float32)        # Mono-Mitschnitt des gehörten Feeds
         self.state = "idle"                              # idle | next | live | out
@@ -66,23 +69,26 @@ class DjCore:
         out_hold = self.state == "out" and (self.now - (self.demoted_since or 0)) < 3.0
         own_target = 1.0 if (self.state in ("live", "next") or out_hold) and self.grid is not None else 0.0
         self.g_own += float(np.clip(own_target - self.g_own, -step, step))
-        tone = np.zeros(n, np.float32)
+        # Ausklang der Kicks aus den vorigen Blöcken zuerst entnehmen: was dieser Block neu nach
+        # ``pending`` schreibt, gehört in die folgenden Blöcke (sonst Vorecho bis zu einem Block vor
+        # dem Kick, der Onset rückt im Mittel um einen halben Block nach vorn, S3788).
+        tone = self.pending[:n].copy()
+        self.pending[:-n] = self.pending[n:]
+        self.pending[-n:] = 0.0
         if self.grid is not None:
+            g0 = self.grid - self.onset_delay                    # Kick-Anfänge
             lo = max(f0, self.last_t + 0.5 * sg.BEAT)            # nach Zeit statt Index: robust gegen Phasensprung
-            k = int(np.ceil((lo - self.grid) / sg.BEAT))
-            while self.grid + k * sg.BEAT < f0 + n:
-                t = self.grid + k * sg.BEAT
+            k = int(np.ceil((lo - g0) / sg.BEAT))
+            while g0 + k * sg.BEAT < f0 + n:
+                t = g0 + k * sg.BEAT
                 i = int(round(t)) - f0
-                if i >= 0:
+                if 0 <= i < n:
                     m = min(len(self.kick), n - i)
                     tone[i:i + m] += self.kick[:m]
                     if m < len(self.kick):
                         self.pending[:len(self.kick) - m] += self.kick[m:]
                 self.last_t = t
                 k += 1
-        tone += self.pending[:n]
-        self.pending[:-n] = self.pending[n:]
-        self.pending[-n:] = 0.0
         pd = sg.pad(self.name, f0, n) * (1.0 if self.g_own > 0.0 else 0.0)
         mixed = tone * self.g_own + pd
         self.frames = f0 + n
