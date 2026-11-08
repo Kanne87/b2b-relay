@@ -180,12 +180,12 @@ class JackIO:
     def _scan(self) -> None:
         c = self.client
         found: dict[str, int] = {}
-        for p in self._ports(name_pattern=r":receive_\d+$", is_output=True):
+        for p in self._ports(name_pattern=r":receive_[0-9]+$", is_output=True):
             m = _RX.match(p.name)
             if m and m["client"] != self.cfg.client_name and m["client"] not in self.cfg.ignore_clients:
                 found[m["client"]] = found.get(m["client"], 0) + 1
         sends: dict[str, int] = {}
-        for p in self._ports(name_pattern=r":send_\d+$", is_input=True):
+        for p in self._ports(name_pattern=r":send_[0-9]+$", is_input=True):
             sends[p.name.split(":", 1)[0]] = sends.get(p.name.split(":", 1)[0], 0) + 1
         for name, nrx in found.items():
             with self._lock:
@@ -212,9 +212,9 @@ class JackIO:
         with self._lock:
             infos = [i for i in self._clients.values() if i.present]
         for info in infos:
-            rx = sorted(p.name for p in self._ports(name_pattern=rf"^{re.escape(info.name)}:receive_\d+$",
+            rx = sorted(p.name for p in self._ports(name_pattern=rf"^{re.escape(info.name)}:receive_[0-9]+$",
                                                       is_output=True))
-            tx = sorted(p.name for p in self._ports(name_pattern=rf"^{re.escape(info.name)}:send_\d+$",
+            tx = sorted(p.name for p in self._ports(name_pattern=rf"^{re.escape(info.name)}:send_[0-9]+$",
                                                       is_input=True))
             ins = [f"{self.cfg.client_name}:in_{_safe(info.name)}_L",
                    f"{self.cfg.client_name}:in_{_safe(info.name)}_R"]
@@ -235,7 +235,7 @@ class JackIO:
                 hears = "program"
             elif live and live != info.name and live in self._clients and self._clients[live].present:
                 lrx = sorted(p.name for p in self._ports(
-                    name_pattern=rf"^{re.escape(live)}:receive_\d+$", is_output=True))
+                    name_pattern=rf"^{re.escape(live)}:receive_[0-9]+$", is_output=True))
                 for i, t in enumerate(tx):
                     if lrx:
                         want_tx[t] = [lrx[min(i, len(lrx) - 1)]]
