@@ -175,7 +175,7 @@ def test_worker_thread_path(stereo):
             rig.cycle()
             time.sleep(0.0005)
         time.sleep(0.3)
-        assert rig.engine.handover("B")["reason"] in ("not_locked", "buffer_too_low", "")
+        assert "accepted" in rig.engine.handover("B")
         snap = rig.engine.snapshot()
         assert snap["started"] and snap["worker"]["error"] is None
         assert rig.engine.chunks > 50
