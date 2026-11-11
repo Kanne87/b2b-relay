@@ -2,7 +2,7 @@
 
 Ablauf je Rolle (Zustand kommt aus ``GET /status`` des Servers und der Datei ``/ctl/next``):
 
-* **live** (Server meldet ``live == NAME``): spielt eigene Kicks + Pad; der Rückkanal ist leer.
+* **live** (Server meldet ``live == NAME``): spielt eigene Kicks, Hats und Pad; der Rückkanal ist leer.
 * **next** (``/ctl/next`` enthält NAME, nicht live): reicht den gehörten Feed der live spielenden Quelle
   durch (das ist der Master, den der Server um die RTT versetzt zurückfädelt), rastet auf das Raster der
   gehörten Kicks ein und mischt eigene Kicks dazu (Pegel 0→1 in 2 s).
@@ -37,6 +37,7 @@ class DjCore:
     def __init__(self, name: str) -> None:
         self.name = name
         self.kick = sg.kick(name)
+        self.hat = sg.hat(name)
         # Schwellendurchgang liegt einige Samples nach dem Kick-Anfang: so viel früher einsetzen, damit der
         # eigene Onset auf dem gehörten Onset liegt (das Raster ``grid`` ist aus Onsets bestimmt)
         self.onset_delay = float(sg.detect_onsets(np.concatenate([np.zeros(64, np.float32), self.kick]))[0] - 64)
@@ -48,6 +49,7 @@ class DjCore:
         self.g_own = 0.0
         self.grid: float | None = None                   # Rasterphase der eigenen Kicks (Frames mod Beat)
         self.last_t = -1e18                              # Zeit (Frames) des zuletzt gespielten Kicks
+        self.last_h = -1e18                              # ... der zuletzt geprüften Hat-Position
         self.lock = sg.PhaseLock()
         self.demoted_since: float | None = None
         self.now = 0.0                                   # Uhr des Steuertakts (Sekunden)
@@ -81,18 +83,30 @@ class DjCore:
             k = int(np.ceil((lo - g0) / sg.BEAT))
             while int(round(g0 + k * sg.BEAT)) < f0 + n:
                 t = g0 + k * sg.BEAT
-                i = int(round(t)) - f0
-                if 0 <= i < n:
-                    m = min(len(self.kick), n - i)
-                    tone[i:i + m] += self.kick[:m]
-                    if m < len(self.kick):
-                        self.pending[:len(self.kick) - m] += self.kick[m:]
+                self._place(self.kick, t, f0, n, tone)
                 self.last_t = t
                 k += 1
+            # Hats auf dem Sechzehntel-Raster der Kicks (Muster nach Index, siehe signals.py)
+            lo = max(f0, self.last_h + 0.5 * sg.HAT_STEP)
+            j = int(np.ceil((lo - g0) / sg.HAT_STEP))
+            while int(round(g0 + j * sg.HAT_STEP)) < f0 + n:
+                t = g0 + j * sg.HAT_STEP
+                if sg.hat_on(self.name, j):
+                    self._place(self.hat, t, f0, n, tone)
+                self.last_h = t
+                j += 1
         pd = sg.pad(self.name, f0, n) * (1.0 if self.g_own > 0.0 else 0.0)
         mixed = tone * self.g_own + pd
         self.frames = f0 + n
         return l_in * self.g_feed + mixed, r_in * self.g_feed + mixed
+
+    def _place(self, wave: np.ndarray, t: float, f0: int, n: int, tone: np.ndarray) -> None:
+        i = int(round(t)) - f0
+        if 0 <= i < n:
+            m = min(len(wave), n - i)
+            tone[i:i + m] += wave[:m]
+            if m < len(wave):
+                self.pending[:len(wave) - m] += wave[m:]
 
     # ---- Steuerung
     def _grid_from_feed(self) -> None:

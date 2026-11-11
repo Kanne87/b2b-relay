@@ -46,6 +46,16 @@ class SampleRing:
             self._buf[:n - first] = block[first:]
         self.end += n
 
+    def overwrite(self, start: int, block: np.ndarray) -> None:
+        """Bereits geschriebenen Bereich [start, start+len) ersetzen (nur, was noch im Ring liegt)."""
+        block = np.asarray(block, dtype=np.float32)
+        lo = max(start, self.start)
+        hi = min(start + len(block), self.end)
+        if hi <= lo:
+            return
+        idx = np.arange(lo, hi) % self.capacity
+        self._buf[idx] = block[lo - start:hi - start]
+
     def read(self, start: int, n: int) -> np.ndarray:
         """Absoluter Bereich [start, start+n) als float32; Unverfügbares ist 0."""
         out = np.zeros(n, dtype=np.float32)

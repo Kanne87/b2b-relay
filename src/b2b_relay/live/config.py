@@ -23,6 +23,9 @@ class LiveConfig:
     max_dev: float = 0.005                # B2B_MAX_DEV
     fade_s: float = 0.1                   # B2B_FADE_S
     bpm_ref: float = 174.0                # B2B_BPM_REF (nur Anzeige)
+    max_rate_ppm: float = 0.0             # B2B_MAX_RATE_PPM: Driftrate der Lag-Schätzung (0: hinter dem JackTrip-Hub
+                                          # läuft jeder Feed im Takt des Servers, Uhrenfehler werden zu Slot-Sprüngen)
+    conceal_max_ms: float = 100.0         # B2B_CONCEAL_MAX_MS: Aussetzer (exakte Nullen) bis zu dieser Länge verschleiern
     # Steuerung
     api_host: str = "127.0.0.1"           # B2B_API_HOST (im Container/Compose 0.0.0.0 + Token)
     api_port: int = 8090                  # B2B_API_PORT
