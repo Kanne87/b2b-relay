@@ -38,10 +38,10 @@ from b2b_relay.sim.analysis import find_gaps_chunked, max_sample_jump  # noqa: E
 
 FS = 48000
 
-LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl)
-    "clean": dict(phase_ms=4.0, unexplained_gaps=0),
-    "wan40": dict(phase_ms=6.0, unexplained_gaps=0),
-    "wan120": dict(phase_ms=10.0, unexplained_gaps=None),     # Verlust 0,5 %: Lücken sind erwartet
+LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl); Lücken: Aussetzer der Strecke verschleiert der Server
+    "clean": dict(phase_ms=1.0, unexplained_gaps=0),
+    "wan40": dict(phase_ms=1.0, unexplained_gaps=0),
+    "wan120": dict(phase_ms=10.0, unexplained_gaps=0),
 }
 
 
@@ -72,11 +72,19 @@ class TimeMap:
         return np.interp(tc, self.ts, self.is_)
 
 
+PRE = int(0.12 * FS)        # Vorlauf der Onset-Erkennung vor dem Fenster (> Ruhephase ``refractory`` 0,08 s)
+
+
 def _onsets_tc(mid: np.ndarray, tm: TimeMap, lo: int, hi: int) -> np.ndarray:
+    """Onsets in [lo, hi) als Inhaltszeit. Erkannt wird ab ``lo − PRE``: beginnt das Fenster mitten in einem
+    Kick oder seinem Ausklang, wäre der erste Schwellendurchgang sonst ein falscher Onset ohne Ruhephase davor
+    (eine Fehlmessung unter 64 verschob das Kreismittel um bis zu 0,8 ms, S3904)."""
     lo, hi = max(lo, 0), min(hi, len(mid))
     if hi - lo < FS:
         return np.empty(0)
-    ons = sg.detect_onsets(mid[lo:hi]) + lo
+    a = max(lo - PRE, 0)
+    ons = sg.detect_onsets(mid[a:hi]) + a
+    ons = ons[ons >= max(lo, a + PRE)]
     return tm.to_t(ons)
 
 
@@ -237,6 +245,9 @@ def markdown(results: list[dict]) -> str:
                    f"{s['xruns']} | "
                    f"{s['buffer_min_s']}/{s['buffer_max_s']} | {s['rate_min']}/{s['rate_max']} | "
                    f"{s['drift_max_abs_ms']} | {'bestanden' if r['acceptance']['passed'] else 'NICHT bestanden'} |")
+    queues = sorted({str(r["jacktrip_queue"]) for r in results if r.get("jacktrip_queue")})
+    if queues:
+        out += ["", f"JackTrip-Queue des Hubs: {', '.join(queues)} (Slots à 256 Frames)"]
     for r in results:
         out += ["", f"## {r['profile']}", ""]
         if r.get("error"):

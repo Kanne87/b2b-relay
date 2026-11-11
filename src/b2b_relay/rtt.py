@@ -117,10 +117,14 @@ class LagTracker:
         self.confirm_span = confirm_span
         self.relock_span = relock_span      # ebenso für das Neu-Aufsetzen nach stimmigen Ausreißern
         self.alpha, self.beta, self.gate = alpha, beta, gate
-        # Annahmebereich um die Vorhersage (Vorgabe: gate). Breiter, wenn der Lag in kleinen Stufen zappelt
-        # (JackTrip-Jitterpuffer: ±1-2 Slots für Bruchteile einer Sekunde): dann gilt der Mittelwert über
-        # ``fit_span`` - genau der mittlere Versatz, den die Musik im Programm hat
+        # Annahmebereich um die Vorhersage (Vorgabe: gate). Mit ``accept`` zappelt der Lag in kleinen Stufen
+        # (JackTrip-Jitterpuffer: ±1-3 Slots für Bruchteile einer Sekunde): Messungen bis ±2·accept gehen in den
+        # Verlauf, die Schätzung ist der Mittelwert der Messungen bis ±accept um ihren Median über ``fit_span``
+        # - der mittlere Versatz, den die Musik im Programm hat. Um den Median, nicht um die eigene Schätzung:
+        # sonst hielte eine Einrastung in einem hohen Zustand die tiefen dauerhaft draußen (+6…+9 ms, S3904).
         self.tol = gate if accept is None else max(gate, accept)
+        self.robust = accept is not None
+        self.wide = 2.0 * self.tol if self.robust else self.tol
         self.rate_limit, self.min_conf, self.reacquire_conf = rate_limit, min_conf, reacquire_conf
         self.reset()
 
@@ -207,7 +211,7 @@ class LagTracker:
             self._cand = (t_c, delay)
             return False
         resid = delay - self.predict(t_c)
-        if abs(resid) <= self.tol:
+        if abs(resid) <= self.wide:
             dt = t_c - self.t_ref
             self.lag = self.predict(t_c) + self.alpha * resid
             if dt > 0:
@@ -219,7 +223,7 @@ class LagTracker:
             self.n_updates += 1
             self._refit(t_c, delay)
             return True
-        # Ausreißer: nur nach drei untereinander stimmigen, sehr sicheren Messungen neu aufsetzen
+        # Ausreißer (außerhalb ±wide): nur nach drei untereinander stimmigen, sehr sicheren Messungen neu aufsetzen
         if conf >= self.reacquire_conf:
             if self._outliers and abs(delay - self._outliers[-1][1]) > self.tol:
                 self._outliers.clear()
@@ -246,6 +250,10 @@ class LagTracker:
         d = np.array([h[1] for h in self._hist])
         tm = t.mean()
         if t.max() - t.min() < self.fit_min_span:
+            return
+        if self.robust and self.rate_limit == 0.0:
+            core = d[np.abs(d - np.median(d)) <= self.tol]
+            self.lag, self.rate, self.t_ref = float(core.mean()), 0.0, float(t_c)
             return
         slope, icpt = np.polyfit(t - tm, d, 1)
         slope = float(np.clip(slope, -self.rate_limit, self.rate_limit))

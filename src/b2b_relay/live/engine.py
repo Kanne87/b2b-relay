@@ -75,17 +75,18 @@ class Engine:
         self.program = AudioRing(2, RING_FRAMES)
         self.out_primed = False
         # Schätzung hinter dem JackTrip-Hub (S3904): Lags sind stückweise konstant und springen um ganze
-        # JackTrip-Slots (Unter-/Überlauf, Verlust im Jitterpuffer) - keine Driftrate; Messungen bis ±12 ms
-        # (> 2 Slots) um die Schätzung gehen in den Mittelwert über 12 s ein (= mittlerer Versatz der Musik),
-        # gesucht wird ±20 ms, weiter weg = Ausreißer (Neu-Aufsetzen nach 2 s); Einrasten nur aus getrennten
-        # Messfenstern, laufende Prüfung gegen den vollen Suchbereich; Aussetzer (exakte Nullen) verschleiert
+        # JackTrip-Slots (Unter-/Überlauf, Verlust im Jitterpuffer) - keine Driftrate; Messungen bis ±24 ms um
+        # die Schätzung gehen in den Verlauf (12 s), geschätzt wird der Mittelwert ±12 ms um dessen Median
+        # (= mittlerer Versatz der Musik); gesucht wird ±30 ms, weiter weg = Ausreißer (Neu-Aufsetzen nach 2 s);
+        # Einrasten nur aus getrennten Messfenstern, laufende Prüfung gegen den vollen Suchbereich; Aussetzer
+        # (exakte Nullen) verschleiert
         est_window_s, est_hop_s = 4.0, 0.5
         rc = RelayConfig(sample_rate=self.fs, buffer_s=cfg.target_buffer_s,
                          target_buffer_s=cfg.target_buffer_s, min_buffer_s=cfg.min_buffer_s,
                          max_dev=cfg.max_dev, fade_s=cfg.fade_s, bpm_ref=cfg.bpm_ref,
                          search_max_s=3.0, block_size=cfg.chunk,
                          est_window_s=est_window_s, est_hop_s=est_hop_s, max_rate_ppm=cfg.max_rate_ppm,
-                         track_window_s=0.020, accept_s=0.012, fit_span_s=12.0,
+                         track_window_s=0.030, accept_s=0.012, fit_span_s=12.0,
                          confirm_s=est_window_s + est_hop_s, relock_s=2.0,
                          verify_every_s=2.0, reacquire_narrow_s=12.0,
                          conceal_max_s=cfg.conceal_max_ms * 1e-3)

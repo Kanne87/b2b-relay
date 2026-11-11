@@ -16,6 +16,8 @@ services:
       B2B_RECORD_DIR: /rec
       B2B_RECORD_FORMAT: float32
       B2B_DRIFT_BASE_S: "10"
+      # Jitterpuffer des Hubs (Slots à 256 Frames): fest statt auto, siehe README "Integrationstest" (S3904)
+      JACKTRIP_QUEUE: ${ITEST_JACKTRIP_QUEUE:-12}
     ports:
       - "${ITEST_API_PORT:-18090}:8090"
     volumes:

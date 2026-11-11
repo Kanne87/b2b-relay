@@ -166,7 +166,7 @@ class NetemUplink:
         self.jitter = jitter_ms * 1e-3 * fs
         self.loss, self.reorder, self.reorder_corr = loss, reorder, reorder_corr
         self.rng = np.random.default_rng(seed)
-        self.jb = JitterBuffer(slot, qlen, fs)
+        self.jb = JitterBuffer(slot, qlen, fs, channels=3)     # Kanal 3: Sendezeit (Frames) als Marke
         self.t = 0                              # Takt-Zähler (Frames)
         self.seq = 0
         self.last_send = -1e18                  # Sendezeit des letzten verzögerten Pakets (netem rate)
@@ -176,6 +176,7 @@ class NetemUplink:
         self._ooo_run = 0
         self.lost = 0
         self._last_reorder_u = 1.0
+        self.delay_log: list[tuple[int, float]] = []   # (Takt, Laufzeit in Frames) für jeden ausgegebenen Takt
 
     def _corr(self, u: float) -> float:
         # netem get_crandom: value = (1−ρ)·u + ρ·last
@@ -195,7 +196,8 @@ class NetemUplink:
             x = self.rng.normal(self.delay, self.jitter) if self.jitter else self.delay
             arrive = max(self.last_send, now + max(x, 0.0))
             self.last_send = arrive
-        self.inflight.append((arrive, seq, np.stack([l, r]).astype(np.float32)))
+        mark = np.full(len(l), float(seq + 1), np.float32)        # Folgenummer + 1 (0 = Lücke)
+        self.inflight.append((arrive, seq, np.stack([l, r, mark]).astype(np.float32)))
 
     def step(self, l: np.ndarray, r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         self.push(l, r)
@@ -223,5 +225,7 @@ class NetemUplink:
             self.last_seq = seq
             self.jb.insert(data, lost * self.slot)
         out = self.jb.read()
+        if out[2, 0] > 0:
+            self.delay_log.append((self.t // self.slot, float(self.t - (out[2, 0] - 1) * self.slot)))
         self.t = t_end
         return out[0], out[1]

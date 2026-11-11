@@ -389,6 +389,10 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 | `B2B_RECORD_DIR` / `B2B_RECORD_FORMAT` | – / pcm16 | Mitschnitt der Programmausgabe als WAV (`pcm16` oder `float32`), daneben `*.trace.jsonl` |
 | `B2B_DRIFT_ENABLE` / `B2B_DRIFT_DEADBAND_MS` / `B2B_DRIFT_SLEW_MS_PER_S` | true / 1 / 1 | Verankerung der Zeitachse an der Wanduhr |
 | `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
+| `B2B_MAX_RATE_PPM` | 0 | Driftrate der Lag-Schätzung (0: hinter dem Hub gibt es keine, siehe „Lag-Schätzung im Betrieb“) |
+| `B2B_CONCEAL_MAX_MS` | 100 | Aussetzer (exakte Nullen) im Feed bis zu dieser Länge verschleiern |
+
+**Empfehlung `JACKTRIP_QUEUE=12`** (statt `auto`): siehe „Lag-Schätzung im Betrieb“. Der Integrationstest läuft mit 12.
 
 ## Client-Aufruf für DJs
 
@@ -438,6 +442,31 @@ ist im PR begründet. Im Status unter `drift`: `drift_ms` (Regelgröße, Ziel < 
 `corrected_ms`, `ppm_60s`, `max_abs_ms`. Alle Lags tragen einen Vorlauf von `B2B_DRIFT_BASE_S` (10 s), damit sie
 positiv bleiben; im Status stehen nur RTTs (relative Lags).
 
+## Lag-Schätzung im Betrieb (hinter dem JackTrip-Hub, S3904)
+
+Hinter dem Hub läuft jeder Feed im Takt des Servers: der Jitterpuffer von JackTrip (Strategie 1) gleicht Uhren- und
+Netzschwankungen aus, indem er ganze Slots (ein Paket = 256 Frames = 5,3 ms) einfügt (Unterlauf: Nullen, Lag +1 Slot)
+oder verwirft (Überlauf: Lag −1 Slot); Verlust ergibt Nullen. Der Lag einer Quelle ist also stückweise konstant und
+springt in Slots, eine stetige Driftrate gibt es nicht. Der Live-Server (`live/engine.py`) stellt den Mixer darauf ein:
+
+| Einstellung | Wert | Wirkung |
+|---|---|---|
+| `max_rate_ppm` | 0 | keine Driftrate. Vorher lief eine falsch geschätzte Rate (bis 500 ppm) bei jeder Übergabe auf alle Quellen über und verschob die Phase um ≈ Rate · 30 s |
+| `confirm_s` | 4,5 s | Einrasten nur aus zwei Messungen getrennter Fenster: ein einzelnes Ereignis (Knacks, Aussetzer, Signalbeginn) kann nicht beide tragen |
+| `verify_every_s`, `verify_ratio`, `verify_strikes` | 2 s, 0,5, 3 | Prüfung gegen den vollen Suchbereich: erreicht der Peak an der Schätzung dreimal in Folge nicht die Hälfte des größten Peaks, wird die Einrastung verworfen (Ereignis `lock_rejected`) und neu gesucht |
+| `track_window_s`, `accept_s`, `fit_span_s` | ±30 ms, ±12 ms, 12 s | Nachführung: Messungen bis ±24 ms gehen in den Verlauf; geschätzt wird der Mittelwert der Messungen ±12 ms um deren Median über 12 s (der mittlere Versatz der Musik, wenn der Feed zwischen Slot-Zuständen wechselt); weiter weg = Ausreißer, nach 2 s stimmiger Ausreißer (`relock_s`) neu aufgesetzt |
+| `reacquire_narrow_s` | 12 s | Neu-Einrasten nach einem Wechsel zuerst nur um Lag(aktiv) + bisherige RTT |
+| `conceal_max_s` | 0,1 s | `conceal.py`: Läufe exakter Nullen (≥ 16 Samples, ≤ 100 ms) zwischen Signal werden im Quellring durch das Signal davor ersetzt (Wellenform-Ersatz, Kosinus-Überblendung 64 Samples). Das geht nachträglich, weil der Mixer jede Quelle erst rund eine Pufferlänge später ausgibt. Längere Stille bleibt (Fallback) |
+
+Die Vorgaben von `RelayConfig` lassen alles beim Verhalten aus Scheibe 1 (Simulation mit stetiger Drift).
+
+**JackTrip-Queue.** Mit `-q auto` hält der Hub nur 4–5 Slots (wan40) bzw. 9–15 (wan120) vor (Server-Log
+„AutoQueue“) - gemacht für Musiker, die wenig Latenz brauchen. Bei 5 ms Jitter läuft der Puffer dann rund alle 2 s
+leer: der Feed des live spielenden DJs liegt in der Nachbildung 29 % der Zeit einen Slot später, und die Messung des
+Phasensprungs rauscht schon ohne Übergabe bis 1,1 ms. Das Relay hat 3 s Puffer und braucht keine kurze Queue: mit
+`JACKTRIP_QUEUE=12` (64 ms, die RTT wächst um rund 40 ms) verschiebt die Strecke bei wan40 nichts mehr. Bei Verlust
+und Umordnung (wan120) bleiben Slot-Sprünge (Nullmessung bis 2,4 ms mit 12, bis 6,7 ms mit `auto`).
+
 ## Callback und xruns
 
 Der JACK-Callback kopiert nur zwischen Port-Puffern und `AudioRing` (lock-frei, ein Schreiber/ein Leser, Zähler statt
@@ -456,9 +485,12 @@ python tests/integration/run.py --profiles clean --handovers 3 --hold-s 45 --out
 ```
 
 `docker-compose.yml` in `tests/integration/`: Server + 3 Test-DJs (`client.py`: eigenes `jackd` dummy, `jacktrip`-Client,
-Kicks bei 174 BPM mit je eigener Klangfarbe plus leises Pad; der Übernehmende rastet auf das Raster des gehörten Feeds ein,
-reicht den Feed durch und mischt seine Kicks phasenrichtig dazu, wie in `sim/`). `tc netem` läuft im Client-Container
-(`cap_add: NET_ADMIN`) auf dessen Upload; der Server bleibt unverändert. Profile:
+Kicks bei 174 BPM mit je eigener Klangfarbe, leise Hi-Hats auf pseudozufälligen Sechzehnteln (je DJ eigenes Muster) plus
+leises Pad; der Übernehmende rastet auf das Raster des gehörten Feeds ein, reicht den Feed durch und mischt seine Kicks
+phasenrichtig dazu, wie in `sim/`). Ohne die Hats wäre das Testsignal exakt periodisch und die Korrelation nur an
+Einzelereignissen eindeutig - genau dort entstanden die falschen Einrastungen (S3904). `tc netem` läuft im
+Client-Container (`cap_add: NET_ADMIN`) auf dessen Upload; der Server bleibt unverändert, bis auf die JackTrip-Queue
+des Hubs: fest 12 Slots (`--jacktrip-queue`, Vorgabe 12; `auto` wie bisher möglich). Profile:
 
 | Profil | netem (Client-Egress) |
 |---|---|
@@ -474,13 +506,21 @@ Bricht ein Profil ab (Zeitüberschreitung, beendeter Container), gibt `run.py` d
 je Container aus (auch unter `<profil>/logs/`), wertet den Mitschnitt aus, soweit es ihn gibt, und schreibt
 `analysis.json` mit Feld `error`; die übrigen Profile laufen weiter. Ohne Docker bildet `tests/itest_sim.py` dieselbe
 Sitzung nach (Live-Server auf dem FakeJack-Prüfstand, drei `DjCore` aus `client.py` mit eigener RTT;
-`tests/test_itest_sim.py`).
+`tests/test_itest_sim.py`). Mit `tests/netsim.py` auch die Netzstörung: netem (`rate`-Zweig: Reihenfolge bleibt,
+Verlust, Umordnung mit Korrelation) und der Empfang am Hub nach JackTrip v2.7.2 (`UdpDataProtocol`: ältere Pakete
+verworfen, Lücken als Verlust; `JitterBuffer` Strategie 1 samt Auto-Queue). Die Nachbildung trifft die Werte aus CI-Run
+13: AutoQueue 3 / 4–6 / 9–16, Aussetzer von 5,3 ms (wan40) bis 32 ms (wan120). `tests/test_relay_net.py` fährt damit
+wan40 und wan120 (Regression S3904).
 
 Ausgabe in `--out`: `report.md`, `results.json` und je Profil `rec/program-*.wav` (Mitschnitt der Programmausgabe),
 `rec/*.trace.jsonl` (Block-Zeilen: Mitschnitt-Index, Inhaltszeit, Rate, Puffer, Drift, xruns; Ereignisse), `status.jsonl`,
 `analysis.json` (je Übergabe auch `lag_s` des Ziels). Gemessen werden je Übergabe der Beat-Phasenfehler (Raster 22 s vor gegen 18 s nach dem Umschaltpunkt,
 in Inhaltszeit, also unabhängig vom Varispeed), Lücken, Sprung-Verhältnis (Klicks) sowie xruns (Abnahme: nur während des Mitschnitts; die Startphase von jackd liegt davor) und Puffer-/Raten-Verlauf.
-Grenzen für die Abnahme: `tests/integration/analyze.py` (`LIMITS`). In GitHub Actions läuft der Test im Job
+Dazu `null_jumps`: dieselbe Phasenmessung mitten in einer Haltezeit, ohne Übergabe (Grundrauschen unter der
+Netzstörung), und `concealed`: Aussetzer der Strecke, die der Server verschleiert hat. Die Onset-Erkennung beginnt
+120 ms vor jedem Messfenster; vorher zählte ein Fenster, das mitten in einem Kick begann, dessen Rest als Onset
+(bis 1,06 ms Fehler ohne jede Übergabe). Grenzen für die Abnahme: `tests/integration/analyze.py` (`LIMITS`):
+Sprung clean und wan40 ≤ 1 ms, wan120 ≤ 10 ms, keine Lücken in allen Profilen. In GitHub Actions läuft der Test im Job
 `integration`, der Bericht ist Artifact und Job-Zusammenfassung.
 
 ## CI
@@ -501,5 +541,11 @@ baut JackTrip ausschließlich als Kommandozeilenprogramm (`-Dnogui=true -Dnovs=t
 * Der Mixer rechnet mono (Mitte/Seite); ein Quellsignal in reiner Gegenphase wird nicht gemessen.
 * Der Docker-Build und der Integrationstest sind in der Entwicklungsumgebung nicht ausgeführt worden (kein Docker); die
   Live-Pfade sind mit einem JACK-Ersatz (`tests/fakejack.py`) getestet, nicht gegen echtes `jackd`/`jacktrip`.
-* Die Netzstörung wirkt nur auf den Upload der Clients.
+* Die Netzstörung wirkt nur auf den Upload der Clients. Die DJs hören den Rückkanal roh vom Hub: Aussetzer dort
+  verschleiert der Server nicht (er sieht sie erst im zurückkommenden Feed).
+* Slot-Sprünge im Feed des live spielenden DJs (JackTrip-Jitterpuffer bei Verlust/Umordnung) kann das Relay nicht
+  sehen; sie verschieben das Programm um 5,3 ms für Bruchteile von Sekunden. Mit `JACKTRIP_QUEUE=auto` kommen
+  Unterläufe schon bei 5 ms Jitter hinzu.
+* Verschleierung ist Wellenform-Ersatz, kein Rekonstruieren: das Programm hat keine Stille, aber an der Stelle
+  wiederholtes Audio (5–30 ms).
 * Nicht Teil: Beat-Analyse, Weboberfläche, Phasemeter (Scheibe 3), Video (4), Begleit-App/Installer (5), Deploy.

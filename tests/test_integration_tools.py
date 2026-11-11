@@ -73,7 +73,7 @@ def test_analysis_measures_phase_jump(tmp_path):
     p = res["per_handover"][0]
     assert p["phase_jump_ms"] == pytest.approx(7.0, abs=0.3)
     assert p["gaps"] == 0 and p["max_jump_ratio"] < 1.5
-    assert not res["acceptance"]["phase_jump<=4.0ms"] and not res["acceptance"]["passed"]
+    assert not res["acceptance"]["phase_jump<=1.0ms"] and not res["acceptance"]["passed"]
     assert "Profil" in analyze.markdown([res])
 
 
@@ -81,11 +81,29 @@ def test_analysis_passes_when_aligned_and_reports_gaps(tmp_path):
     wav, tr = _synthetic_run(tmp_path, jump_ms=0.4)
     res = analyze.analyze_profile(wav, tr, "clean")
     assert res["per_handover"][0]["phase_jump_ms"] == pytest.approx(0.4, abs=0.1)
-    assert res["acceptance"]["phase_jump<=4.0ms"]
+    assert res["acceptance"]["phase_jump<=1.0ms"]
     (tmp_path / "g").mkdir()
     wav2, tr2 = _synthetic_run(tmp_path / "g", 0.0, gap=True)
     res2 = analyze.analyze_profile(wav2, tr2, "wan120")
     assert res2["summary"]["gaps_total"] == 1 and res2["summary"]["max_gap_ms"] == pytest.approx(10.0, abs=0.1)
+
+
+def test_phase_measurement_without_handover_is_zero_wherever_the_window_starts(tmp_path):
+    """Nullmessung: ohne Übergabe misst ``phase_jump`` 0, auch wenn ein Fenster mitten in einem Kick oder in
+    seinem Ausklang beginnt. Vorher galt der erste Schwellendurchgang im Fenster als Onset (ohne Ruhephase
+    davor) und verschob das Kreismittel um bis zu 0,8 ms (S3904)."""
+    n = 120 * FS
+    x = sg.render_track("B", 120, 777.0)
+    wav = tmp_path / "program-null.wav"
+    w = WavWriter(wav, FS, 2, "float32")
+    w.write((x, x))
+    w.close()
+    tm = analyze.TimeMap([{"i": i, "Tc": float(i)} for i in range(0, n, 2048)])
+    mid = x.astype(np.float32)
+    jumps = [analyze.phase_jump(mid, tm, c)["jump_ms"] for c in range(30 * FS, 90 * FS, int(0.37 * FS))]
+    assert max(abs(j) for j in jumps) < 0.02, max(abs(j) for j in jumps)
+    nulls = analyze.null_jumps(mid, tm, [])
+    assert len(nulls) == 1 and abs(nulls[0]["jump_ms"]) < 0.02
 
 
 def test_runner_dry_run_shows_plan_without_docker():
