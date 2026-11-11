@@ -74,10 +74,22 @@ class Engine:
         self.inputs: tuple[SourceInput, ...] = ()       # tuple wird ausgetauscht, nie verändert
         self.program = AudioRing(2, RING_FRAMES)
         self.out_primed = False
+        # Schätzung hinter dem JackTrip-Hub (S3904): Lags sind stückweise konstant und springen um ganze
+        # JackTrip-Slots (Unter-/Überlauf, Verlust im Jitterpuffer) - keine Driftrate; Messungen bis ±24 ms um
+        # die Schätzung gehen in den Verlauf (12 s), geschätzt wird der Mittelwert ±12 ms um dessen Median
+        # (= mittlerer Versatz der Musik); gesucht wird ±30 ms, weiter weg = Ausreißer (Neu-Aufsetzen nach 2 s);
+        # Einrasten nur aus getrennten Messfenstern, laufende Prüfung gegen den vollen Suchbereich; Aussetzer
+        # (exakte Nullen) verschleiert
+        est_window_s, est_hop_s = 4.0, 0.5
         rc = RelayConfig(sample_rate=self.fs, buffer_s=cfg.target_buffer_s,
                          target_buffer_s=cfg.target_buffer_s, min_buffer_s=cfg.min_buffer_s,
                          max_dev=cfg.max_dev, fade_s=cfg.fade_s, bpm_ref=cfg.bpm_ref,
-                         search_max_s=3.0, block_size=cfg.chunk)
+                         search_max_s=3.0, block_size=cfg.chunk,
+                         est_window_s=est_window_s, est_hop_s=est_hop_s, max_rate_ppm=cfg.max_rate_ppm,
+                         track_window_s=0.030, accept_s=0.012, fit_span_s=12.0,
+                         confirm_s=est_window_s + est_hop_s, relock_s=2.0,
+                         verify_every_s=2.0, reacquire_narrow_s=12.0,
+                         conceal_max_s=cfg.conceal_max_ms * 1e-3)
         self.master = RelayMixer(rc)
         self.side = RelayMixer(rc)
         self.side.follow(self.master)
@@ -292,7 +304,7 @@ class Engine:
             rec = {"k": "blk", "i": self._trace_frames, "n": k, "Tc": lb.pos - self._retime_total,
                    "r0": round(lb.r0, 6), "r1": round(lb.r1, 6), "b": round(lb.buffer_s, 4),
                    "wall": m.wall, "drift_ms": round(self.drift.status().drift_ms, 3),
-                   "xr": self.rt.xruns}
+                   "xr": self.rt.xruns, "cc": sum(c for c, _ in m.concealed.values())}
             self._trace.write(json.dumps(rec) + "\n")
         evs = list(m.events)
         new = []

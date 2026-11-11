@@ -131,10 +131,11 @@ class Runner:
         a = self.a
         d = self.out / name
         self.proj = f"b2bit-{name}"
-        self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port)}
+        self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port),
+                          "ITEST_JACKTRIP_QUEUE": str(a.jacktrip_queue)}
         compose = self.compose_cmd()
         error: str | None = None
-        self.say(f"\n=== Profil {name}: netem {netem or '(keine Störung)'} ===")
+        self.say(f"\n=== Profil {name}: netem {netem or '(keine Störung)'}, JackTrip-Queue des Hubs {a.jacktrip_queue} ===")
         if not a.dry_run:
             for sub in ("rec", "ctl"):
                 (d / sub).mkdir(parents=True, exist_ok=True)
@@ -199,6 +200,7 @@ class Runner:
             res = analyze.incomplete(name, error or "unbekannt", reqs)
         elif error:
             res = analyze.mark_incomplete(res, error)
+        res["jacktrip_queue"] = str(a.jacktrip_queue)
         (d / "analysis.json").write_text(json.dumps(res, indent=1))
         return res
 
@@ -264,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default=str(HERE / "out"))
     ap.add_argument("--api-port", type=int, default=18090)
     ap.add_argument("--token", default=os.environ.get("B2B_API_TOKEN", ""))
+    ap.add_argument("--jacktrip-queue", default="12",
+                    help="Jitterpuffer des Hubs (JACKTRIP_QUEUE): Slots oder auto. Vorgabe 12: mit auto verschiebt "
+                         "JackTrip den Feed bei Jitter um ganze Slots (5,3 ms), siehe README")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--no-fail", action="store_true", help="Exit 0 auch bei verfehlter Abnahme")
     ap.add_argument("--log-lines", type=int, default=200, help="Compose-Log-Zeilen je Container bei Abbruch")

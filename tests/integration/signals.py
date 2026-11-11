@@ -6,6 +6,12 @@
 * Alle Kicks haben denselben Anfang (Kosinus, 0,5 ms linearer Anstieg): der Onset ist über
   Klangfarben hinweg vergleichbar und wird als erster Schwellendurchgang des Betrags bestimmt
   (lineare Interpolation, ~20 µs genau).
+* Dazu leise Hi-Hats (Rauschimpulse) auf pseudozufällig gewählten Sechzehnteln, je DJ eigenes Muster: ohne
+  sie wäre das Signal exakt periodisch (Kick im Beat-Abstand, Pad aus Dauertönen), und die Korrelation hätte im
+  eingeschwungenen Zustand gleich hohe Peaks im Abstand eines Beats - eindeutig nur an einzelnen Ereignissen
+  (Signalbeginn, Knackse, Aussetzer), die auch falsche Einrastungen tragen (S3904). Musik ist nie exakt
+  periodisch (README, Grenzen Scheibe 1). Die Hats bleiben mit Pad und durchgereichtem Feed unter der
+  Onset-Schwelle.
 * ``PhaseLock`` bestimmt aus dem gehörten Feed das Raster (Kreismittel der Kick-Zeiten modulo Beat);
   der Übernehmende spielt seine Kicks darauf - wie der DJ, der nach Gehör einstartet (sim/).
 """
@@ -20,6 +26,9 @@ BEAT = FS * 60.0 / BPM                      # Frames je Beat (16551,72…)
 KICK_PEAK = 0.4
 PAD_LEVEL = 0.03
 ONSET_THR = 0.15                            # Schwelle auf |x| (Kick-Peak 0,4; Pad ≤ 0,06)
+HAT_PEAK = 0.02                             # zwei DJs (eigene + durchgereichte Hats) plus zwei Pads: ≤ 0,1
+HAT_STEP = BEAT / 4                         # Sechzehntel
+HAT_SHARE = 110                             # von 256: Anteil der Sechzehntel mit Hat (~43 %)
 
 TIMBRES = {
     #        f_start  f_end  decay_s  harmonic
@@ -41,6 +50,23 @@ def kick(name: str, fs: int = FS) -> np.ndarray:
     return y.astype(np.float32)
 
 
+def hat(name: str, fs: int = FS) -> np.ndarray:
+    """Hi-Hat: hochpassgefiltertes Rauschen (erste Differenz), 8 ms Abklingzeit, je DJ eigenes Rauschen."""
+    rng = np.random.default_rng(sum(map(ord, name)) * 7919)
+    n = int(0.03 * fs)
+    y = np.diff(rng.standard_normal(n + 1)) * np.exp(-np.arange(n) / (0.008 * fs))
+    return (y * HAT_PEAK / np.abs(y).max()).astype(np.float32)
+
+
+def hat_on(name: str, step: int) -> bool:
+    """Spielt DJ ``name`` auf Sechzehntel ``step`` (gezählt ab seinem Raster) eine Hat? Fester Hash."""
+    h = (int(step) * 2654435761 + sum(map(ord, name)) * 40503) & 0xFFFFFFFF
+    h ^= h >> 15
+    h = (h * 2246822519) & 0xFFFFFFFF
+    h ^= h >> 13
+    return (h & 0xFF) < HAT_SHARE
+
+
 def pad(name: str, start: int, n: int, fs: int = FS) -> np.ndarray:
     f1, f2 = TIMBRES.get(name, TIMBRES["A"])["pad"]
     i = (np.arange(start, start + n) / fs).astype(np.float64)
@@ -48,17 +74,18 @@ def pad(name: str, start: int, n: int, fs: int = FS) -> np.ndarray:
 
 
 def render_track(name: str, seconds: float, phase_frames: float = 0.0, fs: int = FS) -> np.ndarray:
-    """Mono-Track (Kicks auf dem Raster ``phase_frames + k·BEAT`` plus Pad) - für Tests und Referenz."""
+    """Mono-Track (Kicks auf dem Raster ``phase_frames + k·BEAT``, Hats, Pad) - für Tests und Referenz."""
     n = int(seconds * fs)
     out = pad(name, 0, n, fs)
-    k = kick(name, fs)
-    t = phase_frames
-    while t < n:
-        i = int(round(t))
-        m = min(len(k), n - i)
-        if m > 0 and i >= 0:
-            out[i:i + m] += k[:m]
-        t += BEAT
+    for wave, step, on in ((kick(name, fs), BEAT, lambda j: True), (hat(name, fs), HAT_STEP, lambda j: hat_on(name, j))):
+        j, t = 0, phase_frames
+        while t < n:
+            i = int(round(t))
+            m = min(len(wave), n - i)
+            if m > 0 and i >= 0 and on(j):
+                out[i:i + m] += wave[:m]
+            j += 1
+            t = phase_frames + j * step
     return out
 
 

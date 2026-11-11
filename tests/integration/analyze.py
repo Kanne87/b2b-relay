@@ -10,9 +10,15 @@ Messgrößen je Übergabe (Schalt-Ereignis ``handoff_effective`` im Trace):
   durchgereichten Kicks des Abgebenden), gemessen in **Inhaltszeit** ``Tc`` (Programmzeit ohne Umlabeln,
   unabhängig vom Varispeed-Tempo), Rasterphase als Kreismittel modulo Beat (174 BPM). Sprung = Differenz
   der Phasen nach/vor, auf ±½ Beat gefaltet.
+* ``null_jump_ms`` (je Haltezeit, ohne Übergabe): dieselbe Messung an einem Punkt mitten in der Haltezeit, an
+  dem nichts umschaltet - das Grundrauschen der Messung unter der Netzstörung (JackTrip verschiebt den Feed
+  der live spielenden Quelle bei Unter-/Überlauf und Verlust um ganze Slots, 5,3 ms). Ein Phasensprung an
+  einer Übergabe ist nur dann ein Fehler des Relays, wenn er deutlich über diesem Rauschen liegt.
 * ``gaps``: Läufe digitaler Stille ≥ 5 ms im Fenster [−1 s, +3 s]; ``max_jump_ratio``: größter Sample-Sprung
   im Fenster [−0,15 s, +0,35 s] gegen das Vergleichsfenster [−3 s, −2 s] (Klicks).
-* gesamt: xruns, Lücken im ganzen Mitschnitt, Puffer- und Raten-Verlauf, Drift.
+* gesamt: xruns, Lücken im ganzen Mitschnitt, Puffer- und Raten-Verlauf, Drift; ``concealed``: Aussetzer der
+  Strecke (exakte Nullen im Feed einer Quelle, z. B. Paketverlust), die der Server verschleiert hat (Trace-Feld
+  ``cc``) - sie sind keine Lücken im Programm, zeigen aber, wie oft die Strecke ausgesetzt hat.
 """
 
 from __future__ import annotations
@@ -32,10 +38,10 @@ from b2b_relay.sim.analysis import find_gaps_chunked, max_sample_jump  # noqa: E
 
 FS = 48000
 
-LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl)
-    "clean": dict(phase_ms=4.0, unexplained_gaps=0),
-    "wan40": dict(phase_ms=6.0, unexplained_gaps=0),
-    "wan120": dict(phase_ms=10.0, unexplained_gaps=None),     # Verlust 0,5 %: Lücken sind erwartet
+LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl); Lücken: Aussetzer der Strecke verschleiert der Server
+    "clean": dict(phase_ms=1.0, unexplained_gaps=0),
+    "wan40": dict(phase_ms=1.0, unexplained_gaps=0),
+    "wan120": dict(phase_ms=10.0, unexplained_gaps=0),
 }
 
 
@@ -66,11 +72,19 @@ class TimeMap:
         return np.interp(tc, self.ts, self.is_)
 
 
+PRE = int(0.12 * FS)        # Vorlauf der Onset-Erkennung vor dem Fenster (> Ruhephase ``refractory`` 0,08 s)
+
+
 def _onsets_tc(mid: np.ndarray, tm: TimeMap, lo: int, hi: int) -> np.ndarray:
+    """Onsets in [lo, hi) als Inhaltszeit. Erkannt wird ab ``lo − PRE``: beginnt das Fenster mitten in einem
+    Kick oder seinem Ausklang, wäre der erste Schwellendurchgang sonst ein falscher Onset ohne Ruhephase davor
+    (eine Fehlmessung unter 64 verschob das Kreismittel um bis zu 0,8 ms, S3904)."""
     lo, hi = max(lo, 0), min(hi, len(mid))
     if hi - lo < FS:
         return np.empty(0)
-    ons = sg.detect_onsets(mid[lo:hi]) + lo
+    a = max(lo - PRE, 0)
+    ons = sg.detect_onsets(mid[a:hi]) + a
+    ons = ons[ons >= max(lo, a + PRE)]
     return tm.to_t(ons)
 
 
@@ -88,6 +102,24 @@ def phase_jump(mid: np.ndarray, tm: TimeMap, i_sw: int, windows=WINDOWS) -> dict
     pb, rb = sg.grid_phase(before)
     pa, ra = sg.grid_phase(after)
     out.update(jump_ms=sg.wrap(pa - pb) / FS * 1e3, r_before=round(rb, 3), r_after=round(ra, 3))
+    return out
+
+
+def null_jumps(mid: np.ndarray, tm: TimeMap, switches: list[int], windows=WINDOWS) -> list[dict]:
+    """Phasensprung-Messung ohne Übergabe: je Abschnitt zwischen zwei Umschaltpunkten (und vor dem ersten) ein
+    Punkt, dessen Fenster ganz im Abschnitt liegen (8 s nach dem einen, 2 s vor dem nächsten Umschaltpunkt)."""
+    (b0, b1), (a0, a1) = windows
+    bounds = [int(8 * FS)] + [i + int(8 * FS) for i in switches]
+    ends = [i - int(2 * FS) for i in switches] + [len(mid) - int(2 * FS)]
+    out = []
+    for lo, hi in zip(bounds, ends):
+        c_min, c_max = lo - int(b0 * FS), hi - int(a1 * FS)
+        if c_max < c_min:
+            continue
+        c = (c_min + c_max) // 2
+        pj = phase_jump(mid, tm, c, windows)
+        if pj["jump_ms"] is not None:
+            out.append({"at_s": round(c / FS, 2), "jump_ms": round(pj["jump_ms"], 3)})
     return out
 
 
@@ -117,6 +149,7 @@ def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = Non
                     "phase_detail": pj, "lag_s": lag,
                     "gaps": len(gaps), "max_gap_ms": round(max((g[1] for g in gaps), default=0) / FS * 1e3, 2),
                     "max_jump_ratio": round(j_win / j_base, 2)})
+    nulls = null_jumps(mid, tm, [int(tm.to_idx(e["Tc_switch"])) for e in eff], windows)
     gaps_all = find_gaps_chunked(mid[int(8 * FS):], FS, 5.0)
     b = np.array([x["b"] for x in blk])
     r = np.array([x["r0"] for x in blk])
@@ -129,10 +162,12 @@ def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = Non
         "profile": name, "wav": str(wav), "duration_s": round(len(mid) / FS, 1),
         "handovers_effective": len(eff), "handovers_refused": len(refused), "fallbacks": len(falls),
         "per_handover": per,
+        "null_jumps": nulls,
         "summary": {
             "phase_jump_max_abs_ms": round(max((abs(j) for j in jumps), default=float("nan")), 3),
             "phase_jump_mean_abs_ms": round(float(np.mean(np.abs(jumps))), 3) if jumps else None,
             "phase_jump_missing": len(per) - len(jumps),
+            "null_jump_max_abs_ms": round(max((abs(x["jump_ms"]) for x in nulls), default=float("nan")), 3),
             "gaps_total": len(gaps_all), "max_gap_ms": round(max((g[1] for g in gaps_all), default=0) / FS * 1e3, 2),
             "max_jump_ratio": max((p["max_jump_ratio"] for p in per), default=None),
             "xruns": int(blk[-1]["xr"]) if blk else None,
@@ -142,6 +177,7 @@ def analyze_profile(wav: Path, trace: Path, name: str, status: Path | None = Non
             "rate_min": round(float(r.min()), 5), "rate_max": round(float(r.max()), 5),
             "drift_max_abs_ms": round(float(np.abs(d[len(d) // 10:]).max()), 3) if len(d) else None,
             "drift_final_ms": round(float(d[-1]), 3) if len(d) else None,
+            "concealed": int(blk[-1].get("cc", 0) - blk[0].get("cc", 0)) if blk else None,
         },
         "series": series,
     }
@@ -197,17 +233,21 @@ def mark_incomplete(res: dict, error: str) -> dict:
 
 def markdown(results: list[dict]) -> str:
     out = ["# b2b-relay Integrationstest (Scheibe 2a)", ""]
-    out += ["| Profil | Übergaben | Sprung max (ms) | Sprung Mittel (ms) | Lücken | max Lücke (ms) | xruns | Puffer min/max (s) "
-            "| Rate min/max | Drift max (ms) | Ergebnis |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    out += ["| Profil | Übergaben | Sprung max (ms) | Sprung Mittel (ms) | ohne Übergabe max (ms) | Lücken | max Lücke (ms) | verschleiert | xruns "
+            "| Puffer min/max (s) | Rate min/max | Drift max (ms) | Ergebnis |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         s = r["summary"]
         if not s:
-            out.append(f"| {r['profile']} | – | – | – | – | – | – | – | – | – | abgebrochen |")
+            out.append(f"| {r['profile']} | – | – | – | – | – | – | – | – | – | – | – | abgebrochen |")
             continue
         out.append(f"| {r['profile']} | {r['handovers_effective']} | {s['phase_jump_max_abs_ms']} | "
-                   f"{s['phase_jump_mean_abs_ms']} | {s['gaps_total']} | {s['max_gap_ms']} | {s['xruns']} | "
+                   f"{s['phase_jump_mean_abs_ms']} | {s.get('null_jump_max_abs_ms')} | {s['gaps_total']} | {s['max_gap_ms']} | {s.get('concealed')} | "
+                   f"{s['xruns']} | "
                    f"{s['buffer_min_s']}/{s['buffer_max_s']} | {s['rate_min']}/{s['rate_max']} | "
                    f"{s['drift_max_abs_ms']} | {'bestanden' if r['acceptance']['passed'] else 'NICHT bestanden'} |")
+    queues = sorted({str(r["jacktrip_queue"]) for r in results if r.get("jacktrip_queue")})
+    if queues:
+        out += ["", f"JackTrip-Queue des Hubs: {', '.join(queues)} (Slots à 256 Frames)"]
     for r in results:
         out += ["", f"## {r['profile']}", ""]
         if r.get("error"):
@@ -220,7 +260,9 @@ def markdown(results: list[dict]) -> str:
         failed = [k for k, v in r["acceptance"].items() if not v]
         out += ["", "Abnahme: " + ("alle Kriterien erfüllt." if not failed else "verfehlt: " + ", ".join(failed))]
     out += ["", "Phasensprung = Differenz der Beat-Rasterphase (174 BPM, Inhaltszeit) 22 s vor und 18 s nach dem "
-            "Umschaltpunkt; Netzstörung (tc netem) wirkt nur auf den Upload der Clients (siehe README)."]
+            "Umschaltpunkt; „ohne Übergabe“ = dieselbe Messung mitten in einer Haltezeit (Grundrauschen); "
+            "„verschleiert“ = Aussetzer der Strecke, die der Server überbrückt hat; Netzstörung (tc netem) wirkt "
+            "nur auf den Upload der Clients (siehe README)."]
     return "\n".join(out) + "\n"
 
 

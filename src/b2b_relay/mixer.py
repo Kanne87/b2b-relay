@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .control import BufferController
-from .rtt import LagTracker, gcc_phat
+from .conceal import GapConcealer
+from .rtt import LagTracker, gcc_curve, measure_curve
 from .timeline import SampleRing
 from .varispeed import VarispeedReader
 
@@ -68,6 +69,20 @@ class RelayConfig:
                                         # ab hier (Rückkanal umgeschaltet, neuer Feed angekommen, Ausklang vorbei)
     reacquire_window_s: float = 0.1     # Neu-Einrasten: Suche ± um Lag(aktiv) + bisherige RTT (< ½ Beat bei 174 BPM)
     reacquire_narrow_s: float = 8.0     # so lange nur dort suchen, danach im vollen Bereich
+    # --- Robustheit der Schätzung (Vorgaben: Verhalten wie Scheibe 1; der Live-Server setzt sie, live/engine.py)
+    track_window_s: float | None = None     # Nachführung: Suche ± um die Vorhersage (None = gate_s). Breiter als
+                                            # gate_s macht Sprünge sichtbar (Ausreißer → Neu-Aufsetzen), z. B. ein
+                                            # JackTrip-Slot (256 Frames = 5,3 ms) bei Unter-/Überlauf
+    accept_s: float | None = None       # Nachführung: Messungen bis ± so weit von der Vorhersage gehen in den
+                                        # Mittelwert ein (None = gate_s); weiter weg = Ausreißer
+    fit_span_s: float = 20.0            # Mittelung/Geradenanpassung über so viele Sekunden Messungen
+    confirm_s: float = 0.0              # Einrasten: bestätigende Messung frühestens so viel später (Fenstermitte)
+    relock_s: float = 0.0               # Neu-Aufsetzen nach Ausreißern: diese über mindestens so lange
+    verify_every_s: float | None = None     # Prüfung der Einrastung gegen den vollen Suchbereich (None = aus)
+    verify_ratio: float = 0.5           # Peak an der Schätzung < verify_ratio · größter Peak → Fehlschlag
+    verify_strikes: int = 3             # so viele Fehlschläge in Folge → Einrastung verwerfen, neu suchen
+    verify_min_psr: float = 12.0        # Prüfung zählt nur, wenn der größte Peak so deutlich ist
+    conceal_max_s: float = 0.0          # Läufe exakter Nullen bis zu dieser Länge im Feed verschleiern (0 = aus)
     ring_s: float | None = None
 
     def __post_init__(self) -> None:
@@ -201,6 +216,9 @@ class _Source:
         self.est_from: int | None = None   # Wanduhr, ab der das Messfenster beginnen darf (Neu-Einrasten)
         self.rtt: float | None = None       # Samples: Lag minus Lag der Quelle, die sie zuletzt gehört hat
         self.reacq_until: int | None = None     # bis hier Neu-Einrasten nur um Lag(aktiv) + rtt
+        self.next_verify = 0                     # Wanduhr der nächsten Prüfung gegen den vollen Suchbereich
+        self.strikes = 0                         # Fehlschläge der Prüfung in Folge
+        self.concealer: GapConcealer | None = None
 
 
 class RelayMixer:
@@ -243,8 +261,19 @@ class RelayMixer:
             raise ValueError(f"Quelle {name!r} ist schon registriert")
         c = self.cfg
         tracker = LagTracker(gate=c.gate_s * self.fs, rate_limit=c.max_rate_ppm * 1e-6,
-                             min_conf=c.min_conf)
-        self._sources[name] = _Source(name, SampleRing(int(c.ring_s * self.fs)), tracker, rtt_hint_s)
+                             min_conf=c.min_conf, confirm_span=c.confirm_s * self.fs,
+                             relock_span=c.relock_s * self.fs, fit_span=c.fit_span_s * self.fs,
+                             fit_min_span=2.0 * self.fs,
+                             accept=None if c.accept_s is None else c.accept_s * self.fs)
+        s = _Source(name, SampleRing(int(c.ring_s * self.fs)), tracker, rtt_hint_s)
+        if c.conceal_max_s > 0:
+            s.concealer = GapConcealer(int(round(c.conceal_max_s * self.fs)))
+        self._sources[name] = s
+
+    @property
+    def concealed(self) -> dict[str, tuple[int, int]]:
+        """Je Quelle: verschleierte Aussetzer (Anzahl, Samples), siehe ``conceal.py``."""
+        return {k: (s.concealer.count, s.concealer.samples) for k, s in self._sources.items() if s.concealer}
 
     def set_lag(self, name: str, lag_s: float) -> None:
         """Lag einer Quelle von außen vorgeben (z. B. aus einer anderen Messung; ohne Audio-
@@ -379,6 +408,8 @@ class RelayMixer:
                 blk = np.asarray(blk, dtype=np.float32)
             self._track_level(s, blk, w0)
             s.ring.write(blk)
+            if s.concealer is not None:
+                s.concealer.after_write(s.ring, w0, blk)
         self._wall = w0 + n
         self._update_active()
         if self._wall >= self._next_est:
@@ -435,7 +466,10 @@ class RelayMixer:
                 blk = np.zeros(n, dtype=np.float32)
             elif len(blk) != n:
                 raise ValueError("alle Blöcke müssen gleich lang sein")
-            s.ring.write(np.asarray(blk, dtype=np.float32))
+            blk = np.asarray(blk, dtype=np.float32)
+            s.ring.write(blk)
+            if s.concealer is not None:
+                s.concealer.after_write(s.ring, self._wall, blk)
             if name in m._sources:
                 s.tracker = m._sources[name].tracker
         self._wall = m._wall
@@ -794,10 +828,13 @@ class RelayMixer:
         if float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) < self._sil_thr:
             return
         act_lag = self.lag_of(self._active)
-        if s.tracker.locked and not s.tracker.reacquiring:
-            pred = s.tracker.predict(t_c)
-            lo = int(np.floor(pred - s.tracker.gate))
-            hi = int(np.ceil(pred + s.tracker.gate))
+        tracking = s.tracker.locked and not s.tracker.reacquiring
+        verify = tracking and c.verify_every_s is not None and self._wall >= s.next_verify
+        pred = s.tracker.predict(t_c) if tracking else 0.0
+        half = max(s.tracker.gate, (c.track_window_s or 0.0) * fs)
+        if tracking and not verify:
+            lo = int(np.floor(pred - half))
+            hi = int(np.ceil(pred + half))
         elif s.tracker.reacquiring and s.rtt is not None and self._wall < (s.reacq_until or 0):
             mid = act_lag + s.rtt
             lo = int(np.floor(max(mid - c.reacquire_window_s * fs, act_lag + c.min_rtt_s * fs)))
@@ -811,13 +848,56 @@ class RelayMixer:
         p = self._compose(w0 - hi, n_win + (hi - lo), count=False).astype(np.float32)
         if float(np.sqrt(np.mean(np.square(p, dtype=np.float64)))) < self._sil_thr:
             return
-        m = gcc_phat(x, p, hi - lo)
-        if m is None:
+        curve = gcc_curve(x, p, hi - lo)
+        if curve is None:
             return
-        d = lo + m.delay    # gcc_phat misst relativ zur unteren Suchgrenze lo
-        if d <= lo + 1.5 or d >= hi - 1.5:
+        # Kurvenindex k gehört zum Versatz d = hi − k (gcc_phat misst relativ zur unteren Suchgrenze lo)
+        if verify:
+            s.next_verify = self._wall + int(c.verify_every_s * fs)
+            k_lo, k_hi = int(np.floor(hi - pred - half)), int(np.ceil(hi - pred + half))
+            m = measure_curve(curve, hi - lo, k_lo, k_hi)
+            if not self._verify(s, curve, hi - lo, k_lo, k_hi, t_c, pred, lo):
+                return
+            if m is None:
+                return
+            lo_t, hi_t = hi - k_hi, hi - k_lo      # Rand des Nachführbereichs
+        else:
+            m = measure_curve(curve, hi - lo)
+            if m is None:
+                return
+            lo_t, hi_t = lo, hi
+        d = lo + m.delay
+        if d <= lo_t + 1.5 or d >= hi_t - 1.5:
             return          # Maximum am Rand: der wahre Peak liegt außerhalb des Suchbereichs
         s.tracker.update(t_c, d, m.confidence)
+
+    def _verify(self, s: _Source, curve: np.ndarray, max_shift: int, k_lo: int, k_hi: int,
+                t_c: float, pred: float, lo: int) -> bool:
+        """Trägt die Einrastung? Der Peak um die Schätzung muss mindestens ``verify_ratio`` des größten Peaks
+        im vollen Suchbereich erreichen. Ein Einrasten auf ein einzelnes Ereignis (Knacks beim Umschalten des
+        Rückkanals, Aussetzer, Signalbeginn) hält das nicht, sobald das Ereignis aus dem Messfenster ist: die
+        Nachführung sucht nur um die Vorhersage und fände von dort nie zurück (S3904). Nach
+        ``verify_strikes`` Fehlschlägen in Folge wird die Einrastung verworfen und neu gesucht.
+        Rückgabe False: Quelle wurde zurückgesetzt."""
+        c = self.cfg
+        g = measure_curve(curve, max_shift)
+        seg = curve[max(k_lo, 0):min(k_hi, max_shift) + 1]
+        if g is None or len(seg) == 0 or g.psr < c.verify_min_psr:
+            return True                             # nichts Deutliches gemessen: kein Urteil
+        top = float(np.max(curve[:max_shift + 1]))
+        here = float(seg.max())
+        if here >= c.verify_ratio * top or self._still_rendered(s.name):
+            s.strikes = 0
+            return True
+        s.strikes += 1
+        if s.strikes < c.verify_strikes:
+            return True
+        self._event("lock_rejected", source=s.name, lag_s=round(pred / self.fs, 6),
+                    best_s=round((lo + g.delay) / self.fs, 6), support=round(here / top, 3))
+        s.strikes = 0
+        s.tracker.reset()
+        s.rtt = None
+        return False
 
     # -- Fallback
 
