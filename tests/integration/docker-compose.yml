@@ -53,3 +53,16 @@ services:
       SERVER_HOST: server
       API_URL: http://server:8090
       CTL_DIR: /ctl
+  # Szenario noname (S3904): JackTrip-Client ohne --remotename, der Hub benennt ihn nach der Adresse
+  # ('__ffff_<ip>'); startet erst, wenn der Server schon läuft (run.py). Nur mit --profile noname.
+  clientN:
+    <<: *client
+    profiles: [noname]
+    environment:
+      DJ_NAME: A                        # Klangfarbe des Testsignals
+      DJ_LIVE_MATCH: any                # live = irgendein DJ ist live (einziger Client, Name unbekannt)
+      NO_REMOTENAME: "1"
+      NETEM: ${NETEM:-}
+      SERVER_HOST: server
+      API_URL: http://server:8090
+      CTL_DIR: /ctl

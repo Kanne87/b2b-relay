@@ -31,7 +31,10 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-jacktrip -C "${SERVER}" --remotename "${DJ_NAME}" -n 2 -q auto &
+# NO_REMOTENAME=1: ohne --remotename wie ein GUI-Client ohne "Remote Name" (Hub benennt nach der Adresse)
+NAME_ARGS=(--remotename "${DJ_NAME}")
+[ "${NO_REMOTENAME:-0}" = "1" ] && NAME_ARGS=()
+jacktrip -C "${SERVER}" ${NAME_ARGS[@]+"${NAME_ARGS[@]}"} -n 2 -q auto &
 PIDS+=($!)
 
 python /opt/itest/client.py &

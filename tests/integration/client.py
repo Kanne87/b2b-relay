@@ -143,9 +143,12 @@ class DjCore:
 
 
 class Dj:
-    def __init__(self, name: str, api: str, ctl: str) -> None:
+    def __init__(self, name: str, api: str, ctl: str, live_match: str = "") -> None:
         import jack
         self.name, self.api, self.ctl = name, api.rstrip("/"), ctl
+        # "any": Client ohne --remotename kennt seinen Namen am Server nicht; als einziger DJ ist er live, sobald
+        # irgendeiner live ist
+        self.live_match = live_match
         self.c = jack.Client(f"dj_{name}", no_start_server=True)
         assert self.c.samplerate == FS, self.c.samplerate
         self.i = [self.c.inports.register(f"in_{k}") for k in (1, 2)]
@@ -177,7 +180,10 @@ class Dj:
     def loop(self) -> None:
         while not self.stop.wait(0.2):
             st = self._status()
-            msg = self.core.control(st.get("live") if st else None, self._next_name(), time.monotonic())
+            live = st.get("live") if st else None
+            if live and self.live_match == "any":
+                live = self.name
+            msg = self.core.control(live, self._next_name(), time.monotonic())
             if msg:
                 print(msg, flush=True)
 
@@ -226,4 +232,4 @@ class Dj:
 
 if __name__ == "__main__":
     Dj(os.environ["DJ_NAME"], os.environ.get("API_URL", "http://server:8090"),
-       os.environ.get("CTL_DIR", "/ctl")).run()
+       os.environ.get("CTL_DIR", "/ctl"), os.environ.get("DJ_LIVE_MATCH", "")).run()

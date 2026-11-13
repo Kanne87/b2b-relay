@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import queue
+import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,6 +39,7 @@ from .wav import WavWriter
 
 RING_FRAMES = 1 << 17           # 131072 Frames = 2,7 s je Quelle / Ausgang
 OUT_PRIME_CHUNKS = 2            # Ausgang beginnt erst mit so vielen Blöcken Vorrat
+PROGRAM_SILENCE_DB = -60.0      # Programmblock darunter zählt als stumm (program_silent_s)
 
 
 class SourceInput:
@@ -119,6 +122,10 @@ class Engine:
         self._k = cfg.chunk
         self._l = {}
         self._r = {}
+        # Programmpegel: Energie der Ausgabeblöcke der letzten Sekunde (beide Kanäle), stumme Frames in Folge
+        self._prog_e: deque[tuple[float, int]] = deque(maxlen=max(1, -(-self.fs // self._k)))
+        self._prog_quiet = 0
+        self._next_dbg = 0.0
 
     # ------------------------------------------------------------------ Eingänge (andere Threads)
 
@@ -282,6 +289,12 @@ class Engine:
         m = self.master.process(mid, k)
         s = self.side.process(sid, k)
         left, right = m + s, m - s
+        e = float(left.dot(left) + right.dot(right))
+        self._prog_e.append((e, 2 * k))
+        if e / (2 * k) > 10.0 ** (PROGRAM_SILENCE_DB / 10.0):
+            self._prog_quiet = 0
+        else:
+            self._prog_quiet += k
         if self._wav:
             self._wav.write((left, right))
             if self._trace:
@@ -294,6 +307,27 @@ class Engine:
         if now >= self._next_snap:
             self._next_snap = now + 0.25
             self._publish()
+        if self.cfg.debug_pos and now >= self._next_dbg:
+            self._next_dbg = now + 1.0
+            self._debug_line()
+
+    def _debug_line(self) -> None:
+        """Eine Zeile je Sekunde (B2B_DEBUG_POS): Lag, Leseposition und Ringende der aktiven Quelle (Wanduhr-Index),
+        Puffer aus dem Lag-Modell, echter Vorrat, Programmpegel, Unterläufe. Für die Live-Probe."""
+        m = self.master
+        rp = m.read_position()
+        sup = m.supply_s
+        rec = {"uptime_s": round(self.mono() - self._started_mono, 1), "pos": rp,
+               "buffer_s": round(m.buffer_s, 3), "supply_s": None if sup is None else round(sup, 3),
+               "program_level_db": round(self.program_level_db, 1), "underruns": m.status.underruns}
+        print("b2b-debug " + json.dumps(rec), file=sys.stderr, flush=True)
+
+    @property
+    def program_level_db(self) -> float:
+        """RMS-Pegel des Programms über die letzte Sekunde (dBFS, beide Kanäle)."""
+        e = sum(x for x, _ in self._prog_e)
+        n = sum(c for _, c in self._prog_e)
+        return max(-120.0, 10.0 * np.log10(e / n + 1e-14)) if n else -120.0
 
     def _write_trace(self, k: int) -> None:
         """Eine Zeile je Block: Mitschnitt-Index → Programmzeit (ohne Umlabeln, "Inhaltszeit"), Rate, Puffer;
@@ -363,6 +397,7 @@ class Engine:
             "silent": st.silent, "no_source": st.no_source,
             "buffer": None if bs is None else {
                 "buffer_s": round(bs.buffer_s, 3), "target_s": bs.target_s, "min_s": bs.min_s,
+                "supply_s": _r(bs.supply_s, 3),
                 "rate": round(bs.rate, 5), "rate_bpm": round(bs.rate_bpm, 2),
                 "handover_release": bs.release, "handover_wait_s": bs.wait_s,
                 "handoff": {k: {"ok": o.ok, "buffer_after_s": round(o.buffer_after_s, 3),
@@ -374,6 +409,8 @@ class Engine:
                       "ppm_60s": _r(d.ppm_60s, 1), "max_abs_ms": round(d.max_abs_ms, 3),
                       "credits_ms": round(d.credits_ms, 1)},
             "underruns": st.underruns,
+            "program_level_db": round(self.program_level_db, 1),
+            "program_silent_s": round(self._prog_quiet / self.fs, 1),
             "jack": {"xruns": rt.xruns, "cb_errors": rt.cb_errors, "out_underruns": rt.out_underruns,
                      "cpu_load": round(rt.cpu_load, 1), "frames": rt.frames},
             "worker": {"load": round(self.load, 3), "chunks": self.chunks, "error": self.last_error,

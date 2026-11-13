@@ -13,6 +13,11 @@ der genannten Wartezeit erneut) und lässt den Rest der Haltezeit laufen. Danach
 Programm-Mitschnitts (``analyze.py``): Ergebnis als ``results.json`` und ``report.md``.
 Exit 0, wenn alle Abnahmekriterien aller Profile erfüllt sind (``--no-fail``: immer 0).
 
+Profil ``noname`` (S3904): nur Server und ein JackTrip-Client **ohne** ``--remotename`` (der Hub benennt ihn nach
+der Adresse, ``__ffff_<ip>``), der erst ``--late-join-s`` (20 s) nach dem Server startet - wie ein echter DJ, der
+sich in den laufenden Dienst einwählt. Der Orchestrator findet den Namen über ``/status``, setzt ihn live und
+prüft nach ``--noname-hold-s``, dass das Programm seinen Ton führt (Pegel je Haltezeit, ``underruns`` steigt nicht).
+
 Bricht ein Profil ab (Zeitüberschreitung, beendeter Container, Fehler der Auswertung), gibt der Lauf die
 letzten ``--log-lines`` (200) Zeilen der Compose-Logs je Container aus (auch nach ``<profil>/logs/``),
 wertet den Mitschnitt aus, soweit er reicht, und schreibt ``analysis.json`` mit Feld ``error``; die übrigen
@@ -44,7 +49,9 @@ PROFILES = {
     "clean": "",
     "wan40": "delay 40ms 5ms distribution normal rate 1000mbit",
     "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit",
+    "noname": "",
 }
+SOLO = {"noname"}           # Profile mit einem einzigen, spät verbundenen Client ohne Remote Name
 DJS = ["A", "B", "C"]
 
 
@@ -99,7 +106,8 @@ class Runner:
 
     # ---------------------------------------------------------------- Container
     def compose_cmd(self) -> list[str]:
-        return ["docker", "compose", "-f", str(COMPOSE), "-p", self.proj]
+        prof = ["--profile", "noname"] if getattr(self, "solo", False) else []
+        return ["docker", "compose", "-f", str(COMPOSE), "-p", self.proj] + prof
 
     def check_alive(self) -> None:
         """Bricht ab, wenn ein Container des Profils beendet ist (statt bis zur Zeitüberschreitung zu warten)."""
@@ -131,6 +139,8 @@ class Runner:
         a = self.a
         d = self.out / name
         self.proj = f"b2bit-{name}"
+        self.solo = name in SOLO
+        self.client_name: str | None = None
         self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port),
                           "ITEST_JACKTRIP_QUEUE": str(a.jacktrip_queue)}
         compose = self.compose_cmd()
@@ -146,24 +156,27 @@ class Runner:
         stop = threading.Event()
         reqs: list[dict] = []
         try:
-            self.say("  [1] Stack starten")
-            self.sh(compose + ["up", "-d"] + ([] if a.no_build else ["--build"]), env)
-            self.say("  [2] warten auf /healthz und auf die DJs A, B, C (Clients present)")
-            if not a.dry_run:
-                self.wait("Server-API", lambda: self.http("GET", "/healthz")[0] == 200, 120)
-                self.wait("DJs verbunden", lambda: self._present() >= set(DJS), a.connect_timeout_s)
-            self.say(f"  [3] POST /handover {{to: A}} (erster Live-DJ), Einlaufzeit {a.warmup_s:.0f} s")
-            if not a.dry_run:
-                self.wait("A live", lambda: self.http("POST", "/handover", {"to": "A"})[0] in (200, 409), 30)
-                threading.Thread(target=self._log_status, args=(status_log, stop), daemon=True).start()
-                time.sleep(a.warmup_s)
-            for k in range(1, a.handovers + 1):
-                frm, to = DJS[(k - 1) % 3], DJS[k % 3]
-                self.say(f"  [4.{k}] Übergabe {k}/{a.handovers}: {frm} → {to}  (ctl/next={to}, {a.lead_s:.0f} s Vorlauf, "
-                         f"POST /handover, dann bis {a.hold_s:.0f} s Haltezeit)")
-                if a.dry_run:
-                    continue
-                reqs.append(self._handover(d, frm, to))
+            if self.solo:
+                self._solo_steps(compose, env, status_log, stop)
+            else:
+                self.say("  [1] Stack starten")
+                self.sh(compose + ["up", "-d"] + ([] if a.no_build else ["--build"]), env)
+                self.say("  [2] warten auf /healthz und auf die DJs A, B, C (Clients present)")
+                if not a.dry_run:
+                    self.wait("Server-API", lambda: self.http("GET", "/healthz")[0] == 200, 120)
+                    self.wait("DJs verbunden", lambda: self._present() >= set(DJS), a.connect_timeout_s)
+                self.say(f"  [3] POST /handover {{to: A}} (erster Live-DJ), Einlaufzeit {a.warmup_s:.0f} s")
+                if not a.dry_run:
+                    self.wait("A live", lambda: self.http("POST", "/handover", {"to": "A"})[0] in (200, 409), 30)
+                    threading.Thread(target=self._log_status, args=(status_log, stop), daemon=True).start()
+                    time.sleep(a.warmup_s)
+                for k in range(1, a.handovers + 1):
+                    frm, to = DJS[(k - 1) % 3], DJS[k % 3]
+                    self.say(f"  [4.{k}] Übergabe {k}/{a.handovers}: {frm} → {to}  (ctl/next={to}, {a.lead_s:.0f} s Vorlauf, "
+                             f"POST /handover, dann bis {a.hold_s:.0f} s Haltezeit)")
+                    if a.dry_run:
+                        continue
+                    reqs.append(self._handover(d, frm, to))
             self.say(f"  [5] Nachlauf {a.settle_s:.0f} s, Mitschnitt schließen")
             if not a.dry_run:
                 time.sleep(a.settle_s)
@@ -200,9 +213,41 @@ class Runner:
             res = analyze.incomplete(name, error or "unbekannt", reqs)
         elif error:
             res = analyze.mark_incomplete(res, error)
+        if self.solo:
+            res["client_name"] = self.client_name
+            if not error and not a.dry_run:
+                ok = self.client_name is not None and self.client_name not in DJS
+                res["acceptance"] = dict(res["acceptance"], client_without_remotename=ok)
+                res["acceptance"]["passed"] = all(v for k, v in res["acceptance"].items() if k != "passed")
         res["jacktrip_queue"] = str(a.jacktrip_queue)
         (d / "analysis.json").write_text(json.dumps(res, indent=1))
         return res
+
+    def _solo_steps(self, compose: list[str], env: dict, status_log: Path, stop: threading.Event) -> None:
+        a = self.a
+        build = [] if a.no_build else ["--build"]
+        self.say("  [1] Server starten (ohne Clients)")
+        self.sh(compose + ["up", "-d"] + build + ["server"], env)
+        if not a.dry_run:
+            self.wait("Server-API", lambda: self.http("GET", "/healthz")[0] == 200, 120)
+            threading.Thread(target=self._log_status, args=(status_log, stop), daemon=True).start()
+        self.say(f"  [2] {a.late_join_s:.0f} s warten, dann Client ohne --remotename starten (später Join)")
+        if not a.dry_run:
+            time.sleep(a.late_join_s)
+        self.sh(compose + ["up", "-d"] + build + ["clientN"], env)
+        self.say("  [3] Namen des Clients aus /status (nicht A/B/C), POST /handover an ihn")
+        if a.dry_run:
+            self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
+            return
+        names = self.wait("Client ohne Remote Name verbunden", lambda: self._present() - set(DJS), a.connect_timeout_s)
+        self.client_name = sorted(names)[0]
+        self.say(f"      Client erscheint als {self.client_name!r}")
+        self.wait(f"{self.client_name} live",
+                  lambda: self.http("POST", "/handover", {"to": self.client_name})[0] in (200, 409)
+                  and self.http("GET", "/status")[1].get("live") == self.client_name, 30)
+        self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
+        time.sleep(a.noname_hold_s)
+        self.check_alive()
 
     def _present(self) -> set[str]:
         code, js = self.http("GET", "/status")
@@ -263,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--warmup-s", type=float, default=45.0)
     ap.add_argument("--settle-s", type=float, default=20.0)
     ap.add_argument("--connect-timeout-s", type=float, default=240.0)
+    ap.add_argument("--late-join-s", type=float, default=20.0,
+                    help="Profil noname: so lange nach dem Server startet der Client (später Join, S3904)")
+    ap.add_argument("--noname-hold-s", type=float, default=90.0, help="Profil noname: Haltezeit nach dem Live-Setzen")
     ap.add_argument("--out", default=str(HERE / "out"))
     ap.add_argument("--api-port", type=int, default=18090)
     ap.add_argument("--token", default=os.environ.get("B2B_API_TOKEN", ""))
@@ -278,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         if n not in PROFILES:
             ap.error(f"unbekanntes Profil {n!r}")
     r = Runner(a)
-    total = (a.warmup_s + a.handovers * a.hold_s + a.settle_s) * len(names) / 60
+    total = sum((a.late_join_s + a.noname_hold_s if n in SOLO else a.warmup_s + a.handovers * a.hold_s) + a.settle_s
+                for n in names) / 60
     print(f"Integrationstest: Profile {names}, je {a.handovers} Übergaben in Folge (A→B→C→…), "
           f"{a.hold_s:.0f} s je Übergabe; geschätzt {total:.0f} min ohne Image-Bau")
     print(f"Ausgabe: {r.out}   (results.json, report.md, je Profil rec/*.wav + *.trace.jsonl, status.jsonl)")

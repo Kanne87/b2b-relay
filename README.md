@@ -225,14 +225,16 @@ Alle anderen Gründe (`not_locked`, `estimate_stale`, …) bleiben wie in Scheib
 
 | Feld | Bedeutung |
 |---|---|
-| `buffer_s` | aktueller Puffer B |
+| `buffer_s` | aktueller Puffer B (Live-Rand aus dem Lag-Modell minus Ausgabeposition; die Regelgröße) |
+| `supply_s` | echter Vorrat: Ende des Rings der aktiven Quelle (`ring.end`, was wirklich angekommen ist) minus Leseposition der Ausgabe in diesem Ring. Gegenprobe zu `buffer_s`; beide sind gleich, solange Ring-Index und Wanduhr übereinstimmen. Negativ = die Ausgabe liest Nicht-Angekommenes (stummes Programm, `underruns` steigt). `None` ohne aktive Quelle |
 | `rate`, `rate_bpm` | Ausgabe-Tempo r und äquivalente BPM (`bpm_ref` · r, Standard 174, z. B. 173,1) |
 | `release`, `wait_s` | Freigabe der Übergabe nach Pufferkriterium (ja/nein) und Sekunden bis dahin (0 = frei) |
 | `handoff[quelle]` | je Ziel: `ok`, `buffer_after_s`, `lag_growth_s`, `wait_s` |
 | `eta_target_s` | Sekunden, bis B im Ruhebereich um das Ziel liegt |
 | `output_delay_s`, `lag_s` | `D_eff = w − T_aus` und Lag der aktiven Quelle |
 
-Für Traces gibt es `mixer.last_block` (Leseposition, Rate am Blockanfang/-ende, Puffer) sowie `mixer.buffer_s`,
+Für Traces gibt es `mixer.last_block` (Leseposition, Rate am Blockanfang/-ende, Puffer), `mixer.read_position()`
+(Lag, Leseposition und Ringende der aktiven Quelle als Wanduhr-Index) sowie `mixer.buffer_s`, `mixer.supply_s`,
 `mixer.rate`, `mixer.output_position`. `mixer.set_lag(name, lag_s)` setzt einen von außen gemessenen Lag (ohne
 Audio-Schätzung, z. B. für Tests).
 
@@ -243,6 +245,10 @@ Mixer hängt am absoluten Lag:
 
 * Ringe halten nur das Fenster Ausgabe…Ankunft (B plus RTT der Übergabe) und das Schätzfenster:
   `ring_s = est_window + search_max + max(buffer_s, target) + deadband + 2` (ca. 12 s je Quelle).
+* Der Index im Ring einer Quelle ist die Wanduhr: eine Quelle, die erst während der Sitzung angemeldet wird, beginnt
+  bei der Wanduhr ihrer Anmeldung (`SampleRing(capacity, start)`). Bis S3904 begann jeder Ring bei 0; ein DJ, der
+  sich mehr als eine Pufferlänge nach dem Start verband, wurde um seine Anmeldezeit zu spät gelesen (stummes Programm,
+  siehe „Befund S3904“).
 * Die RTT-Suche läuft relativ zum Lag der aktiven Quelle (`search_max_s` = größte gesuchte RTT darüber, Standard 3 s),
   nicht mehr absolut.
 * Ausgabeposition als `(int, Bruchteil)`; Segmente werden relativ zur Ausgabeposition verworfen; `events` ist ein
@@ -391,6 +397,7 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 | `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
 | `B2B_MAX_RATE_PPM` | 0 | Driftrate der Lag-Schätzung (0: hinter dem Hub gibt es keine, siehe „Lag-Schätzung im Betrieb“) |
 | `B2B_CONCEAL_MAX_MS` | 100 | Aussetzer (exakte Nullen) im Feed bis zu dieser Länge verschleiern |
+| `B2B_DEBUG_POS` | false | Diagnose: je Sekunde eine Zeile `b2b-debug {…}` auf stderr (Container-Log) mit Lag, Leseposition und Ringende der aktiven Quelle (`pos`), `buffer_s`, `supply_s`, `program_level_db`, `underruns` |
 
 **Empfehlung `JACKTRIP_QUEUE=12`** (statt `auto`): siehe „Lag-Schätzung im Betrieb“. Der Integrationstest läuft mit 12.
 
@@ -400,7 +407,9 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 jacktrip -C <host> --remotename <name> -n 2 -q auto
 ```
 
-Der Name ist die Identität im Status, in `/roles` und `/handover`. Linux mit JACK: wie oben, Audio in/aus
+Der Name ist die Identität im Status, in `/roles` und `/handover`. Ohne `--remotename` (in der GUI: kein
+„Remote Name“) benennt der Hub den Client nach seiner Adresse, z. B. `__ffff_<ip>`; er funktioniert als DJ genauso
+(Rolle aus `B2B_DEFAULT_ROLE`, `/handover` mit diesem Namen), nur ist der Name nicht sprechend und wechselt mit der IP. Linux mit JACK: wie oben, Audio in/aus
 `JackTrip:send_*` / `JackTrip:receive_*`. **macOS/Windows ohne JACK** nutzen das RtAudio-Backend (in den
 JackTrip-Paketen enthalten): `jacktrip -R -C <host> --remotename <name> -n 2 -q auto` (Gerät wählen mit
 `--audiodevice`, Liste mit `--listdevices`). Feste Samplerate 48 kHz.
@@ -427,6 +436,11 @@ curl -s -XPOST localhost:8090/roles    -H 'content-type: application/json' -d '{
   `sources` (je Quelle `rtt_ms`, `jitter_ms` = Streuung der Lag-Messungen, `drift_ppm`, Konfidenz, Pegel), `drift`,
   `jack` (`xruns`, `out_underruns`, `cb_errors`, `cpu_load`), `worker` (Rechenlast, verworfene Frames), `clients`
   (Name, Rolle, `live`, was der Client hört), `events`, `recording`. `GET /healthz` für Healthchecks.
+  Ob das Programm wirklich Ton führt: `program_level_db` (RMS der Programmausgabe über die letzte Sekunde, dBFS,
+  beide Kanäle; −120 = digitale Stille), `program_silent_s` (Sekunden, seit denen jeder Ausgabeblock unter −60 dBFS
+  liegt; 0 = Ton) und `buffer.supply_s` (echter Vorrat der aktiven Quelle, siehe „Status-API“; `buffer.buffer_s` ist
+  die Regelgröße aus dem Lag-Modell). `underruns` zählt Ausgabeblöcke, deren Leseposition hinter dem Ende des
+  Quellrings liegt; im eingeschwungenen Betrieb steigt er nicht.
 * `POST /handover {"to": name}`: 200 bei Annahme; 409 mit `reason`/`message`/`wait_s` bei Verweigerung
   (z. B. `buffer_too_low`, `not_locked`), 404 bei unbekanntem Namen. Ohne aktive Quelle setzt es die erste.
 * `POST /roles {"client", "role": "dj"|"listener"}`: der live spielende DJ kann nicht Hörer werden (409).
@@ -467,6 +481,19 @@ Phasensprungs rauscht schon ohne Übergabe bis 1,1 ms. Das Relay hat 3 s Puffer 
 `JACKTRIP_QUEUE=12` (64 ms, die RTT wächst um rund 40 ms) verschiebt die Strecke bei wan40 nichts mehr. Bei Verlust
 und Umordnung (wan120) bleiben Slot-Sprünge (Nullmessung bis 2,4 ms mit 12, bis 6,7 ms mit `auto`).
 
+## Befund S3904: stummes Programm bei spät verbundenem DJ
+
+Live-Probe 13.11.2026 (ein Windows-Client, RtAudio, ohne Remote Name): Programm 100 % exakte Nullen, `underruns`
++23,5/s (jeder Worker-Block), `buffer_s` 3,0, Pegel der Quelle −23…−32 dB. Ursache: Der Mixer legte den Ring einer
+Quelle bei ihrer Anmeldung mit Index 0 an, liest ihn aber nach Wanduhr (Index = Samples seit Start der Engine). Der
+DJ verband sich etliche Sekunden nach dem Start; seine Daten lagen im Ring um die Anmeldezeit `W` zu früh, die
+Leseposition (Wanduhr − 3 s) also `W − 3 s` hinter `ring.end` - Nullen und ein Unterlauf je Block. `buffer_s` kommt aus
+dem Lag-Modell und merkt davon nichts. Im Integrationstest verbinden sich die Test-DJs, während der Server startet
+(CI-Run 15: alle Container in 0,2 s gestartet, alle DJs nach 6,5 s da, angemeldet vor oder kurz nach dem Start der
+Engine): Versatz unter der Pufferlänge, das Programm war hörbar. Fix: Ring beginnt bei der Wanduhr der Anmeldung.
+Regression: `tests/test_live_late_join.py`; der Integrationstest prüft den Programmpegel je Haltezeit und fährt das
+Profil `noname` (später Join ohne Remote Name).
+
 ## Callback und xruns
 
 Der JACK-Callback kopiert nur zwischen Port-Puffern und `AudioRing` (lock-frei, ein Schreiber/ein Leser, Zähler statt
@@ -480,7 +507,7 @@ voreingestellt (`JACK_REALTIME`).
 
 ```bash
 python tests/integration/run.py --dry-run                    # Ablauf anzeigen, startet nichts
-python tests/integration/run.py                              # 3 Profile x 10 Übergaben, ca. 40 min + Image-Bau
+python tests/integration/run.py                              # 3 Profile x 10 Übergaben + noname, ca. 43 min + Image-Bau
 python tests/integration/run.py --profiles clean --handovers 3 --hold-s 45 --out /tmp/itest
 ```
 
@@ -497,6 +524,7 @@ des Hubs: fest 12 Slots (`--jacktrip-queue`, Vorgabe 12; `auto` wie bisher mögl
 | `clean` | keine |
 | `wan40` | `delay 40ms 5ms distribution normal rate 1000mbit` |
 | `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit` |
+| `noname` | keine; nur Server und ein Client **ohne `--remotename`** (`clientN`, Compose-Profil `noname`), der `--late-join-s` (20 s) nach dem Server startet. Der Orchestrator findet seinen Namen (`__ffff_<ip>` o. ä.) über `/status`, setzt ihn live und hält `--noname-hold-s` (90 s); keine Übergabe (S3904) |
 
 `rate 1000mbit` hält die Paketreihenfolge: ohne `rate` sortiert netem jedes Paket nach seiner eigenen Zufallsverzögerung,
 bei 5 ms Jitter und 5,33 ms Paketabstand kämen rund 23 % der JackTrip-Pakete hinter ihrem Nachfolger an und gingen als
@@ -520,7 +548,10 @@ Dazu `null_jumps`: dieselbe Phasenmessung mitten in einer Haltezeit, ohne Überg
 Netzstörung), und `concealed`: Aussetzer der Strecke, die der Server verschleiert hat. Die Onset-Erkennung beginnt
 120 ms vor jedem Messfenster; vorher zählte ein Fenster, das mitten in einem Kick begann, dessen Rest als Onset
 (bis 1,06 ms Fehler ohne jede Übergabe). Grenzen für die Abnahme: `tests/integration/analyze.py` (`LIMITS`):
-Sprung clean und wan40 ≤ 1 ms, wan120 ≤ 10 ms, keine Lücken in allen Profilen. In GitHub Actions läuft der Test im Job
+Sprung clean und wan40 ≤ 1 ms, wan120 ≤ 10 ms, keine Lücken in allen Profilen. Seit S3904 außerdem in allen
+Profilen `program_audible` (`holds`: Pegel je Haltezeit ab 5 s nach dem Hörbarwerden bzw. nach jedem Umschaltpunkt
+bis 1 s vor dem nächsten; kein 1-s-Block unter −60 dBFS) und `underruns_steady` (`underruns` aus `status.jsonl` steigt
+in den letzten 30 s nicht); im Profil `noname` zusätzlich `client_without_remotename` (der Name ist keiner von A/B/C). In GitHub Actions läuft der Test im Job
 `integration`, der Bericht ist Artifact und Job-Zusammenfassung.
 
 ## CI
@@ -539,7 +570,8 @@ baut JackTrip ausschließlich als Kommandozeilenprogramm (`-Dnogui=true -Dnovs=t
 
 * Keine Authentifizierung der JackTrip-Verbindung (der Hub nimmt jeden Client an); die API ist nur per Token geschützt.
 * Der Mixer rechnet mono (Mitte/Seite); ein Quellsignal in reiner Gegenphase wird nicht gemessen.
-* Der Docker-Build und der Integrationstest sind in der Entwicklungsumgebung nicht ausgeführt worden (kein Docker); die
+* Der Docker-Build und der Integrationstest sind in der Entwicklungsumgebung nicht ausgeführt worden (kein Docker; das
+  Profil `noname` wird erst im CI-Lauf abgenommen); die
   Live-Pfade sind mit einem JACK-Ersatz (`tests/fakejack.py`) getestet, nicht gegen echtes `jackd`/`jacktrip`.
 * Die Netzstörung wirkt nur auf den Upload der Clients. Die DJs hören den Rückkanal roh vom Hub: Aussetzer dort
   verschleiert der Server nicht (er sieht sie erst im zurückkommenden Feed).
