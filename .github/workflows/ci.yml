@@ -111,7 +111,7 @@ jobs:
           sudo modprobe sch_netem || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe sch_netem; }
           docker run --rm --cap-add NET_ADMIN ubuntu:24.04 bash -c \
             'apt-get update -qq && apt-get install -y -qq iproute2 >/dev/null && tc qdisc add dev lo root netem delay 1ms && tc qdisc show dev lo'
-      - name: Integrationstest (3 Profile x 10 Übergaben)
+      - name: Integrationstest (3 Profile x 10 Übergaben, dazu noname - später Join ohne Remote Name)
         run: python tests/integration/run.py --out "$RUNNER_TEMP/itest"
       - name: Bericht in die Job-Zusammenfassung
         if: always()
