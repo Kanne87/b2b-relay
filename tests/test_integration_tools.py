@@ -61,6 +61,7 @@ def _synthetic_run(tmp_path, jump_ms, gap=False):
         for i in range(0, n, 2048):
             fh.write(json.dumps({"k": "blk", "i": i, "n": 2048, "Tc": float(i), "r0": 1.0, "r1": 1.0,
                                  "b": 3.0, "wall": i, "drift_ms": 0.1, "xr": 0}) + "\n")
+        fh.write(json.dumps({"k": "ev", "i": 0, "wall": 0, "kind": "active_set", "source": "A"}) + "\n")
         fh.write(json.dumps({"k": "ev", "i": 0, "wall": 0, "kind": "handoff_effective", "source": "B",
                              "previous": "A", "t_switch": 45 * FS, "Tc_switch": 45 * FS}) + "\n")
     return wav, tr
@@ -88,6 +89,53 @@ def test_analysis_passes_when_aligned_and_reports_gaps(tmp_path):
     assert res2["summary"]["gaps_total"] == 1 and res2["summary"]["max_gap_ms"] == pytest.approx(10.0, abs=0.1)
 
 
+def test_analysis_checks_program_level_per_hold_and_underruns(tmp_path):
+    """S3904: Ein stummes Programm bei live spielendem DJ fällt in der Auswertung auf (Pegel je Haltezeit), ebenso
+    ein Unterlaufzähler, der im eingeschwungenen Zustand weiter steigt."""
+    wav, tr = _synthetic_run(tmp_path, jump_ms=0.0)
+    st = tmp_path / "status.jsonl"
+    st.write_text("".join(json.dumps({"t_mono": 100.0 + 2 * k, "underruns": 5, "live": "A"}) + "\n" for k in range(30)))
+    res = analyze.analyze_profile(wav, tr, "clean", st)
+    assert [h["from_s"] for h in res["holds"]] == [8.0, 50.0]           # ab Puffer (3 s) + 5 s bzw. Umschaltpunkt + 5 s
+    assert min(h["min_block_db"] for h in res["holds"]) > -40.0
+    assert res["acceptance"]["program_audible"] and res["acceptance"]["underruns_steady"]
+    assert res["summary"]["underruns_tail"] == 0 and res["acceptance"]["passed"]
+    # Haltezeit nach der Übergabe stumm, Zähler steigt je Block
+    (tmp_path / "s").mkdir()
+    wav2, tr2 = _synthetic_run(tmp_path / "s", jump_ms=0.0)
+    fs, x = analyze.read_wav(wav2)
+    x[55 * FS:85 * FS] = 0.0
+    w = WavWriter(wav2, FS, 2, "float32")
+    w.write((x[:, 0], x[:, 1]))
+    w.close()
+    st.write_text("".join(json.dumps({"t_mono": 100.0 + 2 * k, "underruns": 47 * k}) + "\n" for k in range(30)))
+    res2 = analyze.analyze_profile(wav2, tr2, "clean", st)
+    assert res2["summary"]["silent_blocks"] >= 29 and not res2["acceptance"]["program_audible"]
+    assert res2["summary"]["underruns_tail"] == 47 * 15 and not res2["acceptance"]["underruns_steady"]
+    assert not res2["acceptance"]["passed"] and "Programmpegel je Haltezeit" in analyze.markdown([res2])
+
+
+def test_analysis_profile_without_handovers(tmp_path):
+    """Profil noname: keine Übergabe verlangt; Abnahme an Ton, Lücken, Puffer."""
+    n = 60 * FS
+    x = sg.render_track("A", 60, 777.0)
+    x[: 23 * FS] = 0.0                                     # später Join: vorher stumm
+    wav = tmp_path / "program-solo.wav"
+    w = WavWriter(wav, FS, 2, "float32")
+    w.write((x, x))
+    w.close()
+    tr = tmp_path / "program-solo.trace.jsonl"
+    with open(tr, "w") as fh:
+        for i in range(0, n, 2048):
+            fh.write(json.dumps({"k": "blk", "i": i, "n": 2048, "Tc": float(i), "r0": 1.0, "r1": 1.0,
+                                 "b": 3.0, "wall": i, "drift_ms": 0.1, "xr": 0}) + "\n")
+        fh.write(json.dumps({"k": "ev", "i": 20 * FS, "wall": 0, "kind": "active_set", "source": "__ffff_x"}) + "\n")
+    res = analyze.analyze_profile(wav, tr, "noname", None, [])
+    acc = res["acceptance"]
+    assert "all_handovers_effective" not in acc and acc["program_audible"] and acc["no_gaps"], acc
+    assert acc["passed"]
+
+
 def test_phase_measurement_without_handover_is_zero_wherever_the_window_starts(tmp_path):
     """Nullmessung: ohne Übergabe misst ``phase_jump`` 0, auch wenn ein Fenster mitten in einem Kick oder in
     seinem Ausklang beginnt. Vorher galt der erste Schwellendurchgang im Fenster als Onset (ohne Ruhephase
@@ -111,7 +159,7 @@ def test_runner_dry_run_shows_plan_without_docker():
     assert out.returncode == 0, out.stderr
     txt = out.stdout
     for needle in ("clean", "wan40", "wan120", "delay 40ms 5ms", "loss 0.5%", "docker compose", "10 Übergaben",
-                   "POST /handover", "analyze"):
+                   "POST /handover", "analyze", "noname", "--profile noname up -d --build clientN", "ohne --remotename"):
         assert needle in txt, needle
     one = subprocess.run([sys.executable, str(ITEST / "run.py"), "--dry-run", "--profiles", "clean", "--handovers", "2"],
                          capture_output=True, text=True, timeout=60)
