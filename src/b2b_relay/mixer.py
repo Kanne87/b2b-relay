@@ -168,6 +168,7 @@ class BufferStatus:
     wait_s: float | None            # kürzeste Wartezeit bis zur Freigabe (0 = frei)
     eta_target_s: float | None      # Sekunden, bis B im Totband um das Ziel liegt
     handoff: dict[str, HandoffOutlook] = field(default_factory=dict)
+    supply_s: float | None = None   # echter Vorrat: Ende des Rings der aktiven Quelle minus Leseposition
 
 
 @dataclass(frozen=True)
@@ -265,7 +266,10 @@ class RelayMixer:
                              relock_span=c.relock_s * self.fs, fit_span=c.fit_span_s * self.fs,
                              fit_min_span=2.0 * self.fs,
                              accept=None if c.accept_s is None else c.accept_s * self.fs)
-        s = _Source(name, SampleRing(int(c.ring_s * self.fs)), tracker, rtt_hint_s)
+        # Ring-Index = Wanduhr: eine Quelle, die erst nach dem Start angemeldet wird, beginnt bei der heutigen
+        # Wanduhr, nicht bei 0. Sonst liegt jede Leseposition (Wanduhr − Puffer) um die Anmeldezeit hinter dem
+        # Ende ihres Rings - stummes Programm, Unterlauf je Block, Schätzfenster leer (S3904)
+        s = _Source(name, SampleRing(int(c.ring_s * self.fs), start=self._wall), tracker, rtt_hint_s)
         if c.conceal_max_s > 0:
             s.concealer = GapConcealer(int(round(c.conceal_max_s * self.fs)))
         self._sources[name] = s
@@ -558,6 +562,29 @@ class RelayMixer:
         """Puffer B in Sekunden: Live-Rand der aktiven Quelle minus Ausgabeposition."""
         return self._buffer_at(self.output_position)
 
+    @property
+    def supply_s(self) -> float | None:
+        """Echter Vorrat der aktiven Quelle in Sekunden: angekommene Samples in ihrem Ring (``ring.end``) minus
+        Leseposition der Ausgabe. Gegenprobe zu ``buffer_s``, das aus dem Lag-Modell kommt (Live-Rand); beide
+        stimmen überein, solange Ring-Index und Wanduhr übereinstimmen. Negativ = Ausgabe liest Nicht-Angekommenes
+        (Unterlauf, stummes Programm). None ohne aktive Quelle."""
+        if self._active is None:
+            return None
+        s = self._sources[self._active]
+        pos = float(self._positions(s, np.array([self.output_position]))[0])
+        return (s.ring.end - pos) / self.fs
+
+    def read_position(self) -> dict | None:
+        """Diagnose der aktiven Quelle (Samples, Wanduhr-Index): Lag, Leseposition der Ausgabe im Quellring,
+        Ende des Rings."""
+        if self._active is None:
+            return None
+        s = self._sources[self._active]
+        pos = float(self._positions(s, np.array([self.output_position]))[0])
+        return {"source": self._active, "wall": self._wall, "lag": round(self.lag_of(self._active), 1),
+                "out_T": round(self.output_position, 1), "read_w": round(pos, 1), "ring_end": s.ring.end,
+                "ring_start": s.ring.start}
+
     def _buffer_at(self, pos: float) -> float:
         lag = self.lag_of(self._active) if self._active else 0.0
         return (self._wall - lag - pos) / self.fs
@@ -594,9 +621,10 @@ class RelayMixer:
         r = self.rate
         b = self.buffer_s
         delay = (self._wall - self.output_position) / self.fs
+        supply = self.supply_s
         if self._ctl is None:
             return BufferStatus(False, b, None, None, 1.0, c.bpm_ref, delay, lag,
-                                release=False, wait_s=None, eta_target_s=None)
+                                release=False, wait_s=None, eta_target_s=None, supply_s=supply)
         pending = self._segments[-1].src if self._segments else None
         outlooks: dict[str, HandoffOutlook] = {}
         for name, s in self._sources.items():
@@ -614,7 +642,7 @@ class RelayMixer:
             eta = self._ctl.time_to(b, lo if b < c.target_buffer_s else hi)
         return BufferStatus(True, b, c.target_buffer_s, c.min_buffer_s, r, c.bpm_ref * r, delay,
                             lag, release=any(o.ok for o in outlooks.values()), wait_s=wait,
-                            eta_target_s=eta, handoff=outlooks)
+                            eta_target_s=eta, handoff=outlooks, supply_s=supply)
 
     def lag_of(self, name: str, wall: float | None = None) -> float:
         """Lag der Quelle in Samples (Schätzung, mit Drift fortgeschrieben)."""

@@ -43,6 +43,8 @@ class LiveConfig:
     drift_base_s: float = 10.0            # B2B_DRIFT_BASE_S (Vorlauf, damit Lags positiv bleiben)
     drift_deadband_ms: float = 1.0        # B2B_DRIFT_DEADBAND_MS
     drift_slew_ms_per_s: float = 1.0      # B2B_DRIFT_SLEW_MS_PER_S
+    # Diagnose
+    debug_pos: bool = False               # B2B_DEBUG_POS: je Sekunde eine Zeile 'b2b-debug {...}' auf stderr
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "LiveConfig":

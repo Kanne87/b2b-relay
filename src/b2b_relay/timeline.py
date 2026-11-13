@@ -18,18 +18,20 @@ class SampleRing:
 
     ``write`` hängt Samples an (Index ``end`` wächst). ``read`` liefert beliebige absolute
     Bereiche; was nie geschrieben oder bereits überschrieben wurde, kommt als Nullen zurück.
+    ``start`` ist der absolute Index des ersten Samples: Der Mixer legt den Ring einer Quelle mit
+    der Wanduhr ihrer Anmeldung an, damit Ring-Index und Wanduhr gleich sind (S3904).
     """
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, start: int = 0) -> None:
         if capacity <= 0:
             raise ValueError("capacity muss > 0 sein")
         self.capacity = int(capacity)
         self._buf = np.zeros(self.capacity, dtype=np.float32)
-        self.end = 0  # absoluter Index des nächsten zu schreibenden Samples
+        self.end = int(start)  # absoluter Index des nächsten zu schreibenden Samples
 
     @property
     def start(self) -> int:
-        """Ältester noch lesbarer absoluter Index."""
+        """Ältester noch lesbarer absoluter Index (davor Liegendes kommt als Null)."""
         return max(0, self.end - self.capacity)
 
     def write(self, block: np.ndarray) -> None:
