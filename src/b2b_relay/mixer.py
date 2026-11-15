@@ -248,6 +248,7 @@ class RelayMixer:
         self._stage: VarispeedReader | None = None
         self._ctl: BufferController | None = None
         self._master: RelayMixer | None = None      # Folger-Modus (siehe ``follow``)
+        self._axis_reset = False        # Zeitachse nach ``remove_source`` der aktiven Quelle offen
         self._blk_start: tuple[int, float] = (0, 0.0)   # Leseposition (int, frac) vor dem Block
         if c.target_buffer_s is not None:
             self._stage = VarispeedReader(-float(self._D))
@@ -274,6 +275,36 @@ class RelayMixer:
             s.concealer = GapConcealer(int(round(c.conceal_max_s * self.fs)))
         self._sources[name] = s
 
+    def remove_source(self, name: str) -> bool:
+        """Quelle abmelden (der Client ist weg). Gibt zurück, ob sie die aktive war. War sie aktiv, gibt es danach
+        keine aktive Quelle mehr (``no_source``, Programm = Stille, Zeitachse offen): die nächste ``set_active``
+        beginnt wie nach dem Start. Die Lags der übrigen Quellen hingen an der alten Achse und werden verworfen; sie
+        rasten wie wartende DJs neu ein. Auf dem Folger nur die Quelle entfernen (Stand kommt vom Master)."""
+        self._get(name)
+        was_active = name == self._active
+        del self._sources[name]
+        if self._master is not None:
+            return was_active
+        if was_active:
+            self._segments = []
+            self._cur_seg = None
+            self._active = None
+            self._previous = None
+            self._silent_flag = False
+            self._fallback = False
+            self._axis_reset = True
+            for s in self._sources.values():
+                s.tracker.reset()
+                s.is_reference = False
+                s.rtt = None
+                s.est_from = s.reacq_until = None
+        else:
+            self._segments = [g for g in self._segments if g.src != name]
+            if self._previous == name:
+                self._previous = None
+        self._event("source_removed", source=name, was_active=was_active)
+        return was_active
+
     @property
     def concealed(self) -> dict[str, tuple[int, int]]:
         """Je Quelle: verschleierte Aussetzer (Anzahl, Samples), siehe ``conceal.py``."""
@@ -294,6 +325,14 @@ class RelayMixer:
             raise RuntimeError("set_active ist nur für die erste Quelle; danach request_handoff")
         s.tracker.set_reference(0.0, float(self._wall))
         s.is_reference = True
+        if self._axis_reset:
+            # neue Zeitachse wie nach dem Start: Ausgabe liest den Puffer D hinter der Wanduhr (die alte Achse
+            # lief ohne Quelle weiter und läge Sekunden daneben)
+            self._axis_reset = False
+            if self._stage is not None:
+                self._stage.pos_int, self._stage.pos_frac = self._wall - self._D, 0.0
+                self._blk_start = (self._stage.pos_int, 0.0)
+            self._t_blk = self._wall - self._D
         self._cur_seg = _Segment(self._wall - 1, name, 1)
         self._segments.append(self._cur_seg)
         self._active = name
