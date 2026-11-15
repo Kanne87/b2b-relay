@@ -18,9 +18,12 @@ der Adresse, ``__ffff_<ip>``), der erst ``--late-join-s`` (20 s) nach dem Server
 sich in den laufenden Dienst einwählt. Der Orchestrator findet den Namen über ``/status``, setzt ihn live und
 prüft nach ``--noname-hold-s``, dass das Programm seinen Ton führt (Pegel je Haltezeit, ``underruns`` steigt nicht).
 
-Profil ``gone`` (S4006): wie ``noname``, danach wird der Client beendet. Innerhalb von 15 s muss ``/status``
-``no_source=true`` (``live`` leer, Ereignis ``source_lost``) und ``recording_info.state == "waiting"`` melden;
-die Quelle darf nicht mehr als verbunden gelten. Dieses Profil prüft nur den Status, nicht das Audio.
+Profile ``gone`` und ``gone_hard`` (S4006): wie ``noname``, danach wird der Client beendet - ``gone`` sauber (SIGINT,
+JackTrip sendet das Stopp-Paket), ``gone_hard`` hart (SIGKILL des Containers, kein Stopp-Paket, die Ports bleiben
+bis zum UDP-Timeout des Hubs). ``/status`` muss ``no_source=true`` (``live`` leer, Ereignis ``source_lost``) und
+``recording_info.state == "waiting"`` melden; die Quelle darf nicht mehr als verbunden gelten. Die Fristen folgen den
+eingestellten Zeiten: Karenz ``B2B_SOURCE_GRACE_S`` (5 s) bzw. Stille-Frist ``B2B_SOURCE_SILENCE_S`` (12 s) plus
+Zuschlag 5 s, die Aufnahme folgt 2 s Nachlauf später. Diese Profile prüfen nur den Status, nicht das Audio.
 
 Bricht ein Profil ab (Zeitüberschreitung, beendeter Container, Fehler der Auswertung), gibt der Lauf die
 letzten ``--log-lines`` (200) Zeilen der Compose-Logs je Container aus (auch nach ``<profil>/logs/``),
@@ -55,10 +58,25 @@ PROFILES = {
     "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit",
     "noname": "",
     "gone": "",
+    "gone_hard": "",
 }
-GONE = {"gone"}             # Profil gone (S4006): der einzige Client geht, der Server muss das melden
-SOLO = {"noname"} | GONE    # Profile mit einem einzigen, spät verbundenen Client ohne Remote Name
-GONE_DEADLINE_S = 15.0      # nach dem Ende des Clients: no_source=true und Aufnahme 'waiting' innerhalb dieser Zeit
+# Profile gone / gone_hard (S4006): der einzige Client geht, der Server muss das melden.
+#   gone       sauber: SIGINT -> jacktrip sendet das Stopp-Paket, der Hub entfernt die Ports sofort;
+#              Frist = Karenz B2B_SOURCE_GRACE_S + Zuschlag
+#   gone_hard  hart: SIGKILL des Containers, kein Stopp-Paket; Ports bleiben bis zum UDP-Timeout des Hubs (10 s),
+#              Frist = Stille-Frist B2B_SOURCE_SILENCE_S + Zuschlag
+# Die Fristen leiten sich aus den eingestellten Zeiten ab (dieselben Werte gehen als ITEST_* an den Server).
+GONE = {"gone": "SIGINT", "gone_hard": "SIGKILL"}
+SOLO = {"noname"} | set(GONE)   # Profile mit einem einzigen, spät verbundenen Client ohne Remote Name
+GRACE_S = 5.0               # B2B_SOURCE_GRACE_S im Teststack (= Vorgabe)
+SILENCE_S = 12.0            # B2B_SOURCE_SILENCE_S im Teststack (= Vorgabe)
+SAFETY_S = 5.0              # Zuschlag: Router-Takt 0,5 s, Poll 1 s, Worker-Block, geteilte CI-Runner
+RECORD_HOLD_S = 2.0         # Nachlauf der Aufnahme nach dem Verlust der live-Quelle (recorder.HOLD_S)
+
+
+def gone_deadline(name: str) -> float:
+    """Frist ab dem Beenden des Clients bis no_source=true (Aufnahme 'waiting' kommt RECORD_HOLD_S später)."""
+    return (SILENCE_S if name == "gone_hard" else GRACE_S) + SAFETY_S
 DJS = ["A", "B", "C"]
 
 
@@ -152,7 +170,10 @@ class Runner:
         self.gone: dict | None = None
         self.expected_exit: set[str] = set()
         self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port),
-                          "ITEST_JACKTRIP_QUEUE": str(a.jacktrip_queue)}
+                          "ITEST_JACKTRIP_QUEUE": str(a.jacktrip_queue),
+                          "ITEST_SOURCE_GRACE_S": f"{GRACE_S:g}", "ITEST_SOURCE_SILENCE_S": f"{SILENCE_S:g}"}
+        if name in GONE:
+            env["ITEST_RECORD_ONLY_LIVE"] = "true"      # sonst kann die Aufnahme nie 'waiting' melden
         compose = self.compose_cmd()
         error: str | None = None
         self.say(f"\n=== Profil {name}: netem {netem or '(keine Störung)'}, JackTrip-Queue des Hubs {a.jacktrip_queue} ===")
@@ -252,9 +273,9 @@ class Runner:
         self.sh(compose + ["up", "-d"] + build + ["clientN"], env)
         self.say("  [3] Namen des Clients aus /status (nicht A/B/C), POST /handover an ihn")
         if a.dry_run:
-            self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
+            self.say(f"  [4] Haltezeit {(a.gone_hold_s if self.profile_name in GONE else a.noname_hold_s):.0f} s")
             if self.profile_name in GONE:
-                self.say(f"  [5] Client beenden, innerhalb {GONE_DEADLINE_S:.0f} s no_source=true und Aufnahme 'waiting' erwartet")
+                self._say_gone()
             return
         names = self.wait("Client ohne Remote Name verbunden", lambda: self._present() - set(DJS), a.connect_timeout_s)
         self.client_name = sorted(names)[0]
@@ -262,28 +283,40 @@ class Runner:
         self.wait(f"{self.client_name} live",
                   lambda: self.http("POST", "/handover", {"to": self.client_name})[0] in (200, 409)
                   and self.http("GET", "/status")[1].get("live") == self.client_name, 30)
-        self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
-        time.sleep(a.noname_hold_s)
+        hold = a.gone_hold_s if self.profile_name in GONE else a.noname_hold_s
+        self.say(f"  [4] Haltezeit {hold:.0f} s")
+        time.sleep(hold)
         self.check_alive()
         if self.profile_name in GONE:
             self._gone_steps(compose, env)
 
+    def _say_gone(self) -> None:
+        n = self.profile_name
+        d = gone_deadline(n)
+        self.say(f"  [5] Client beenden ({GONE[n]}), innerhalb {d:.0f} s no_source=true, innerhalb {d + RECORD_HOLD_S + 1:.0f} s "
+                 f"Aufnahme 'waiting' erwartet")
+
     def _gone_steps(self, compose: list[str], env: dict) -> None:
-        """Client beenden, dann innerhalb von GONE_DEADLINE_S: no_source, live leer, Ereignis, Aufnahme 'waiting'."""
-        self.say(f"  [5] Client beenden, innerhalb {GONE_DEADLINE_S:.0f} s no_source=true und Aufnahme 'waiting' erwartet")
+        """Client beenden (gone: SIGINT, gone_hard: SIGKILL), dann: no_source, live leer, Ereignis, Aufnahme 'waiting'."""
+        n = self.profile_name
+        d = gone_deadline(n)
+        self._say_gone()
         self.expected_exit = {"clientN"}        # beendeter Client ist hier gewollt (check_alive)
-        self.sh(compose + ["stop", "-t", "5", "clientN"], env, check=False)
-        t0 = time.monotonic()
-        g: dict = {"deadline_s": GONE_DEADLINE_S, "no_source_s": None, "waiting_s": None}
-        while time.monotonic() - t0 < GONE_DEADLINE_S + 5:
+        t0 = time.monotonic()                   # vor dem Signal: die Frist schließt den Aufruf ein
+        self.sh(compose + ["kill", "-s", GONE[n], "clientN"], env, check=False)
+        g: dict = {"mode": GONE[n], "deadline_s": d, "waiting_deadline_s": d + RECORD_HOLD_S + 1,
+                   "no_source_s": None, "waiting_s": None}
+        while time.monotonic() - t0 < g["waiting_deadline_s"] + SAFETY_S:
             code, js = self.http("GET", "/status", timeout=3)
             if code == 200:
                 el = round(time.monotonic() - t0, 1)
                 if js.get("no_source") and js.get("live") is None and g["no_source_s"] is None:
                     g["no_source_s"] = el
                     g["source_gone"] = self.client_name not in (js.get("sources") or {})
-                    g["source_lost_event"] = any(e.get("kind") == "source_lost" and e.get("source") == self.client_name
-                                                 and e.get("was_live") for e in js.get("events", []))
+                    lost = [e for e in js.get("events", []) if e.get("kind") == "source_lost"
+                            and e.get("source") == self.client_name and e.get("was_live")]
+                    g["source_lost_event"] = bool(lost)
+                    g["source_lost_reason"] = lost[-1].get("reason") if lost else None
                 if (js.get("recording_info") or {}).get("state") == "waiting" and g["waiting_s"] is None:
                     g["waiting_s"] = el
                 if g["no_source_s"] is not None and g["waiting_s"] is not None:
@@ -293,9 +326,10 @@ class Runner:
 
     def _gone_result(self, name: str, error: str | None) -> dict:
         g = self.gone or {}
-        lim = GONE_DEADLINE_S
+        lim = g.get("deadline_s", gone_deadline(name))
+        lim_w = g.get("waiting_deadline_s", lim + RECORD_HOLD_S + 1)
         acc = {"no_source_in_time": g.get("no_source_s") is not None and g["no_source_s"] <= lim,
-               "recording_waiting_in_time": g.get("waiting_s") is not None and g["waiting_s"] <= lim,
+               "recording_waiting_in_time": g.get("waiting_s") is not None and g["waiting_s"] <= lim_w,
                "source_not_listed": bool(g.get("source_gone")),
                "source_lost_event": bool(g.get("source_lost_event")),
                "client_without_remotename": self.client_name is not None and self.client_name not in DJS}
@@ -371,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--late-join-s", type=float, default=20.0,
                     help="Profil noname: so lange nach dem Server startet der Client (später Join, S3904)")
     ap.add_argument("--noname-hold-s", type=float, default=90.0, help="Profil noname: Haltezeit nach dem Live-Setzen")
+    ap.add_argument("--gone-hold-s", type=float, default=30.0, help="Profile gone/gone_hard: Haltezeit vor dem Beenden")
     ap.add_argument("--out", default=str(HERE / "out"))
     ap.add_argument("--api-port", type=int, default=18090)
     ap.add_argument("--token", default=os.environ.get("B2B_API_TOKEN", ""))
@@ -386,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         if n not in PROFILES:
             ap.error(f"unbekanntes Profil {n!r}")
     r = Runner(a)
-    total = sum((a.late_join_s + a.noname_hold_s + (GONE_DEADLINE_S if n in GONE else 0) if n in SOLO else a.warmup_s + a.handovers * a.hold_s) + a.settle_s
+    total = sum(((a.late_join_s + a.gone_hold_s + gone_deadline(n) + RECORD_HOLD_S + 2 * SAFETY_S) if n in GONE else (a.late_join_s + a.noname_hold_s) if n in SOLO else a.warmup_s + a.handovers * a.hold_s) + a.settle_s
                 for n in names) / 60
     print(f"Integrationstest: Profile {names}, je {a.handovers} Übergaben in Folge (A→B→C→…), "
           f"{a.hold_s:.0f} s je Übergabe; geschätzt {total:.0f} min ohne Image-Bau")

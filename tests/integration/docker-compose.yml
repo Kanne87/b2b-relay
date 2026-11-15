@@ -15,7 +15,10 @@ services:
       B2B_AUTO_ACTIVE: "false"          # der Orchestrator bestimmt den ersten Live-DJ
       B2B_RECORD_DIR: /rec
       B2B_RECORD_FORMAT: float32
-      B2B_RECORD_ONLY_LIVE: "false"     # die Auswertung braucht den durchgehenden Mitschnitt
+      # die Auswertung braucht den durchgehenden Mitschnitt; die Profile gone/gone_hard setzen true (Aufnahme 'waiting')
+      B2B_RECORD_ONLY_LIVE: ${ITEST_RECORD_ONLY_LIVE:-false}
+      B2B_SOURCE_GRACE_S: ${ITEST_SOURCE_GRACE_S:-5}        # Frist 'Ports weg' (saubere Abmeldung), run.py leitet die Abnahme davon ab
+      B2B_SOURCE_SILENCE_S: ${ITEST_SOURCE_SILENCE_S:-12}   # Frist 'Ports da, keine Pakete' (harter Abriss)
       B2B_RECORD_SEGMENT_S: "86400"     # eine Datei je Profil (analyze liest genau eine WAV)
       B2B_RECORD_MAX_MB: "0"
       B2B_DRIFT_BASE_S: "10"
