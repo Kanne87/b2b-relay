@@ -38,6 +38,10 @@ class LiveConfig:
     # Mitschnitt
     record_dir: str = ""                  # B2B_RECORD_DIR (leer = aus)
     record_format: str = "pcm16"          # B2B_RECORD_FORMAT: pcm16 | float32
+    record_segment_s: float = 1800.0      # B2B_RECORD_SEGMENT_S: neues Segment nach dieser Dauer (WAV-Grenze 4 GB!)
+    record_max_mb: int = 2048             # B2B_RECORD_MAX_MB: Obergrenze für das Aufnahmeverzeichnis (0 = unbegrenzt)
+    record_only_live: bool = True         # B2B_RECORD_ONLY_LIVE: nur aufnehmen, solange eine Quelle live ist
+    health_stall_s: float = 10.0          # B2B_HEALTH_STALL_S: steht der Worker so lange, antwortet /healthz mit 503
     # Zeitachse an Wanduhr
     drift_enable: bool = True             # B2B_DRIFT_ENABLE
     drift_base_s: float = 10.0            # B2B_DRIFT_BASE_S (Vorlauf, damit Lags positiv bleiben)
@@ -78,6 +82,10 @@ class LiveConfig:
         for r in c.roles.values():
             if r not in ("dj", "listener"):
                 raise ValueError("B2B_ROLES: Rolle dj oder listener")
+        if c.record_segment_s <= 0:
+            raise ValueError("B2B_RECORD_SEGMENT_S muss > 0 sein")
+        if c.record_max_mb < 0:
+            raise ValueError("B2B_RECORD_MAX_MB muss >= 0 sein")
         if c.chunk < 256 or c.chunk % 64:
             raise ValueError("B2B_CHUNK: >= 256 und Vielfaches von 64")
         return c

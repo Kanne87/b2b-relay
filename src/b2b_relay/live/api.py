@@ -33,7 +33,11 @@ def create_app(engine: Engine, io: JackIO, token: str = "") -> FastAPI:
         ok = bool(snap.get("started")) and io.shutdown_reason is None
         if not ok:
             raise HTTPException(503, io.shutdown_reason or "Engine noch nicht gestartet")
-        return {"ok": True}
+        stall = engine.stalled_s()
+        limit = engine.cfg.health_stall_s
+        if limit > 0 and stall > limit:
+            raise HTTPException(503, f"Worker steht seit {stall:.0f} s")
+        return {"ok": True, "worker_stalled_s": round(stall, 1)}
 
     @app.get("/status", dependencies=[Depends(auth)])
     def status() -> dict:

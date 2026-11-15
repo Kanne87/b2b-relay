@@ -393,6 +393,10 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 | `B2B_DEFAULT_ROLE` / `B2B_ROLES` | dj / – | Rolle neuer Clients; `B2B_ROLES="tv=listener,kai=dj"` legt Rollen nach Name fest |
 | `B2B_AUTO_ACTIVE` | true | Der erste verbundene DJ ist live (sonst setzt `POST /handover` den ersten) |
 | `B2B_RECORD_DIR` / `B2B_RECORD_FORMAT` | – / pcm16 | Mitschnitt der Programmausgabe als WAV (`pcm16` oder `float32`), daneben `*.trace.jsonl` |
+| `B2B_RECORD_SEGMENT_S` | 1800 | Aufnahme in Segmenten dieser Dauer (`program-<Start>-<Nr>.wav` + `.trace.jsonl`, nach Name sortierbar); eine WAV trägt höchstens 4 GiB (pcm16 stereo 48 kHz ≈ 6,2 h) |
+| `B2B_RECORD_MAX_MB` | 2048 | Obergrenze für die eigenen Dateien (`program-*.wav`, `program-*.trace.jsonl`) im Aufnahmeverzeichnis; darüber werden die ältesten Segmente gelöscht, andere Dateien nie. 0 = unbegrenzt |
+| `B2B_RECORD_ONLY_LIVE` | true | Nur aufnehmen, solange eine Quelle live ist (2 s Nachlauf); mit der nächsten Quelle beginnt ein neues Segment |
+| `B2B_HEALTH_STALL_S` | 10 | Steht der Worker länger, antwortet `/healthz` mit 503 (Docker-HEALTHCHECK schlägt fehl). 0 = aus |
 | `B2B_DRIFT_ENABLE` / `B2B_DRIFT_DEADBAND_MS` / `B2B_DRIFT_SLEW_MS_PER_S` | true / 1 / 1 | Verankerung der Zeitachse an der Wanduhr |
 | `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
 | `B2B_MAX_RATE_PPM` | 0 | Driftrate der Lag-Schätzung (0: hinter dem Hub gibt es keine, siehe „Lag-Schätzung im Betrieb“) |
@@ -435,7 +439,8 @@ curl -s -XPOST localhost:8090/roles    -H 'content-type: application/json' -d '{
 * `GET /status`: `live`, `previous`, `buffer` (Puffer B, Rate, äquivalente BPM, Freigabe/Wartezeit der Übergabe je Ziel),
   `sources` (je Quelle `rtt_ms`, `jitter_ms` = Streuung der Lag-Messungen, `drift_ppm`, Konfidenz, Pegel), `drift`,
   `jack` (`xruns`, `out_underruns`, `cb_errors`, `cpu_load`), `worker` (Rechenlast, verworfene Frames), `clients`
-  (Name, Rolle, `live`, was der Client hört), `events`, `recording`. `GET /healthz` für Healthchecks.
+  (Name, Rolle, `live`, was der Client hört), `events`, `recording` (aktuelle Datei oder null), `recording_info` (`state`: recording/waiting/error/idle/off, `reason`, `segments`, `bytes`, `errors`, `deleted`). `GET /healthz` (ohne Token) liefert 503, wenn der Worker länger als `B2B_HEALTH_STALL_S` keinen Fortschritt meldet.
+  Fehler beim Schreiben der Aufnahme halten die Engine nie an: Ereignis `recording_error` mit `reason`, nach 10 s neues Segment.
   Ob das Programm wirklich Ton führt: `program_level_db` (RMS der Programmausgabe über die letzte Sekunde, dBFS,
   beide Kanäle; −120 = digitale Stille), `program_silent_s` (Sekunden, seit denen jeder Ausgabeblock unter −60 dBFS
   liegt; 0 = Ton) und `buffer.supply_s` (echter Vorrat der aktiven Quelle, siehe „Status-API“; `buffer.buffer_s` ist

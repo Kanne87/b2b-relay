@@ -27,6 +27,10 @@ services:
       B2B_ROLES: ${B2B_ROLES:-}
       B2B_RECORD_DIR: ${B2B_RECORD_DIR:-}
       B2B_RECORD_FORMAT: ${B2B_RECORD_FORMAT:-pcm16}
+      B2B_RECORD_SEGMENT_S: ${B2B_RECORD_SEGMENT_S:-1800}
+      B2B_RECORD_MAX_MB: ${B2B_RECORD_MAX_MB:-2048}
+      B2B_RECORD_ONLY_LIVE: ${B2B_RECORD_ONLY_LIVE:-true}
+      B2B_HEALTH_STALL_S: ${B2B_HEALTH_STALL_S:-10}
     volumes:
       - ${B2B_RECORD_HOST_DIR:-./recordings}:/rec
     # Echtzeit-Scheduling für jackd (nur mit JACK_REALTIME=1); ohne diese Zeilen läuft jackd mit --no-realtime
