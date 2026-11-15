@@ -36,6 +36,7 @@ class LiveConfig:
     ignore_clients: tuple[str, ...] = ("system", "JackTrip", "PulseAudio JACK Sink")  # B2B_IGNORE_CLIENTS
     router_interval_s: float = 0.5        # B2B_ROUTER_INTERVAL_S
     source_grace_s: float = 5.0           # B2B_SOURCE_GRACE_S: so lange fehlende JACK-Ports toleriert, dann gilt die Quelle als getrennt
+    source_silence_s: float = 12.0        # B2B_SOURCE_SILENCE_S: Ports da, aber so lange nur Nullen (keine Pakete) = getrennt; 0 = aus
     # Mitschnitt
     record_dir: str = ""                  # B2B_RECORD_DIR (leer = aus)
     record_format: str = "pcm16"          # B2B_RECORD_FORMAT: pcm16 | float32
@@ -87,6 +88,8 @@ class LiveConfig:
             raise ValueError("B2B_RECORD_SEGMENT_S muss > 0 sein")
         if c.source_grace_s < 0:
             raise ValueError("B2B_SOURCE_GRACE_S muss >= 0 sein")
+        if c.source_silence_s < 0:
+            raise ValueError("B2B_SOURCE_SILENCE_S muss >= 0 sein")
         if c.record_max_mb < 0:
             raise ValueError("B2B_RECORD_MAX_MB muss >= 0 sein")
         if c.chunk < 256 or c.chunk % 64:

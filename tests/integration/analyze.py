@@ -48,7 +48,7 @@ LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl); Lücken: Aussetzer der
     "wan120": dict(phase_ms=10.0, unexplained_gaps=0),
     # ein DJ ohne --remotename, verbindet sich spät, keine Übergabe: nur Ton, Puffer, Lücken
     "noname": dict(phase_ms=None, unexplained_gaps=0),
-    # Profil gone (S4006) prüft nur den Status (run.py), keine Audioauswertung
+    # Profile gone/gone_hard (S4006) prüfen nur den Status (run.py), keine Audioauswertung
 }
 SILENT_DB = -60.0           # 1-s-Block des Programms darunter: stumm
 AUDIBLE_AFTER_S = 5.0       # Haltezeit gilt ab so viel nach dem Hörbarwerden / Umschaltpunkt (Puffer 3 s + Einblenden)
@@ -324,9 +324,10 @@ def markdown(results: list[dict]) -> str:
                     + ", ".join(f"{h['from_s']}–{h['to_s']} s: {h['level_db']}/{h['min_block_db']}" for h in r["holds"])]
         if r.get("gone") is not None:
             g = r["gone"]
-            out += ["", f"Client beendet: no_source nach {g.get('no_source_s')} s, Aufnahme 'waiting' nach "
-                    f"{g.get('waiting_s')} s (Frist {g.get('deadline_s')} s), Quelle verschwunden: {g.get('source_gone')}, "
-                    f"Ereignis source_lost: {g.get('source_lost_event')}."]
+            out += ["", f"Client beendet ({g.get('mode')}): no_source nach {g.get('no_source_s')} s (Frist {g.get('deadline_s')} s), "
+                    f"Aufnahme 'waiting' nach {g.get('waiting_s')} s (Frist {g.get('waiting_deadline_s')} s), "
+                    f"Quelle verschwunden: {g.get('source_gone')}, Ereignis source_lost: {g.get('source_lost_event')} "
+                    f"(Grund {g.get('source_lost_reason')})."]
         if r.get("client_name"):
             out += ["", f"Client ohne Remote Name erschien als `{r['client_name']}`."]
         failed = [k for k, v in r["acceptance"].items() if not v]

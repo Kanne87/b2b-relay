@@ -7,6 +7,10 @@ SERVER="${SERVER_HOST:-server}"
 
 PIDS=()
 cleanup() {
+  # erst jacktrip (SIGINT: sendet das Stopp-Paket an den Hub = saubere Abmeldung), dann jackd und der Rest
+  if [ -n "${JT_PID:-}" ] && kill -INT "${JT_PID}" 2>/dev/null; then
+    for _ in $(seq 1 30); do kill -0 "${JT_PID}" 2>/dev/null || break; sleep 0.1; done
+  fi
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT TERM INT
@@ -35,6 +39,7 @@ done
 NAME_ARGS=(--remotename "${DJ_NAME}")
 [ "${NO_REMOTENAME:-0}" = "1" ] && NAME_ARGS=()
 jacktrip -C "${SERVER}" ${NAME_ARGS[@]+"${NAME_ARGS[@]}"} -n 2 -q auto &
+JT_PID=$!
 PIDS+=($!)
 
 python /opt/itest/client.py &

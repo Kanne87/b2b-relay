@@ -52,6 +52,9 @@ class SourceInput:
         self.o_eff = 0                      # origin + Frames, die der Überlauf verworfen hat
         self.drops_seen = 0
         self.enabled = False
+        self.quiet = 0                      # Worker: Frames in Folge ohne ein Sample ungleich 0 (kein Paket, Stille)
+        self.dormant = False                # getrennt (Stille), Eingang bleibt offen, nur um die Rückkehr zu sehen
+        self.revived = False                # dormant und wieder Audio gesehen
 
 
 @dataclass
@@ -119,6 +122,7 @@ class Engine:
         self._k = cfg.chunk
         self._l = {}
         self._r = {}
+        self._scratch = (np.zeros(cfg.chunk, np.float32), np.zeros(cfg.chunk, np.float32))
         # Programmpegel: Energie der Ausgabeblöcke der letzten Sekunde (beide Kanäle), stumme Frames in Folge
         self._prog_e: deque[tuple[float, int]] = deque(maxlen=max(1, -(-self.fs // self._k)))
         self._prog_quiet = 0
@@ -127,7 +131,8 @@ class Engine:
     # ------------------------------------------------------------------ Eingänge (andere Threads)
 
     def attach(self, si: SourceInput) -> None:
-        self.inputs = self.inputs + (si,)
+        # gleicher Name ersetzt den alten (getrennter) Eingang; Tupel-Tausch ist für den Callback atomar
+        self.inputs = tuple(i for i in self.inputs if i.name != si.name) + (si,)
 
     def input(self, name: str) -> SourceInput | None:
         return next((i for i in self.inputs if i.name == name), None)
@@ -166,9 +171,11 @@ class Engine:
             si.enabled = enabled
         return self.call(run)
 
-    def drop_source(self, name: str) -> bool:
-        """Quelle getrennt (JACK-Ports weg, Karenz um): aus Mixer und Eingängen nehmen. War sie live, ist danach
-        keine Quelle live (Stille, kein Auto-Übergang); Ereignis ``source_lost``. Gibt zurück, ob sie live war."""
+    def drop_source(self, name: str, reason: str = "ports_gone", keep_input: bool = False) -> bool:
+        """Quelle getrennt (JACK-Ports weg und Karenz um, oder ``reason="silence"``: Ports da, aber keine Pakete):
+        aus Mixer und Eingängen nehmen. War sie live, ist danach keine Quelle live (Stille, kein Auto-Übergang);
+        Ereignis ``source_lost``. ``keep_input``: Eingang bleibt offen (dormant), der Worker erkennt die Rückkehr
+        von Audio (``revived``). Gibt zurück, ob sie live war."""
         def run():
             was_live = self.master.status.active == name
             known = name in self._registered
@@ -178,7 +185,12 @@ class Engine:
                 self._registered.remove(name)
                 self._l.pop(name, None)
                 self._r.pop(name, None)
-            self.inputs = tuple(i for i in self.inputs if i.name != name)
+            si = self.input(name)
+            if keep_input and si is not None:
+                si.enabled = False
+                si.dormant, si.revived, si.quiet = True, False, 0
+            else:
+                self.inputs = tuple(i for i in self.inputs if i.name != name)
             if was_live:
                 # Zeitachse offen: Verankerung und Bezug der Drift-Regelung verwerfen
                 self.drift = DriftMonitor(self.fs, enable=self.cfg.drift_enable,
@@ -186,7 +198,7 @@ class Engine:
                                           slew_ms_per_s=self.cfg.drift_slew_ms_per_s)
                 self._last_active = None
             if known:
-                self._rec_event("source_lost", source=name, was_live=was_live)
+                self._rec_event("source_lost", source=name, was_live=was_live, reason=reason)
             return was_live
         return self.call(run)
 
@@ -294,6 +306,19 @@ class Engine:
             dl[pre:] = 0.0
             dr[pre:] = 0.0
 
+    def _watch_dormant(self, k: int) -> None:
+        """Getrennte Eingänge (Stille) leerlesen und merken, ob wieder Audio kommt."""
+        for si in self.inputs:
+            if not si.dormant:
+                continue
+            n = min(si.ring.available, k)
+            if n <= 0:
+                continue
+            bl, br = self._scratch
+            si.ring.read((bl[:n], br[:n]), n)
+            if bl[:n].any() or br[:n].any():
+                si.revived = True
+
     def _mono_at(self, g: int) -> float:
         f0, m0 = self.rt.stamp
         return m0 + (g - f0) / self.fs
@@ -305,8 +330,11 @@ class Engine:
             dl = self._l.setdefault(name, np.zeros(k, np.float32))
             dr = self._r.setdefault(name, np.zeros(k, np.float32))
             self._fetch(si, k, dl, dr)
+            # Stille-Zähler (Worker, nicht Callback): JackTrip schreibt bei ausbleibenden Paketen exakte Nullen
+            si.quiet = 0 if (dl.any() or dr.any()) else si.quiet + k
             mid[name] = (dl + dr) * 0.5
             sid[name] = (dl - dr) * 0.5
+        self._watch_dormant(k)
         m = self.master.process(mid, k)
         s = self.side.process(sid, k)
         left, right = m + s, m - s

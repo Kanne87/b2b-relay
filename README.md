@@ -397,6 +397,7 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 | `B2B_RECORD_MAX_MB` | 2048 | Obergrenze für die eigenen Dateien (`program-*.wav`, `program-*.trace.jsonl`) im Aufnahmeverzeichnis; darüber werden die ältesten Segmente gelöscht, andere Dateien nie. 0 = unbegrenzt |
 | `B2B_RECORD_ONLY_LIVE` | true | Nur aufnehmen, solange eine Quelle live ist (2 s Nachlauf); mit der nächsten Quelle beginnt ein neues Segment |
 | `B2B_SOURCE_GRACE_S` | 5 | Karenz, die fehlende JACK-Ports (`<name>:receive_N`) einer Quelle toleriert; danach gilt sie als getrennt (siehe „Abgang einer Quelle“) |
+| `B2B_SOURCE_SILENCE_S` | 12 | Stille-Frist: Sind die Ports eines DJ noch da, kommt aber so lange kein Audio (nur exakte Nullen = keine Pakete), gilt er als getrennt (siehe „Abgang einer Quelle“). 0 = aus |
 | `B2B_HEALTH_STALL_S` | 10 | Steht der Worker länger, antwortet `/healthz` mit 503 (Docker-HEALTHCHECK schlägt fehl). 0 = aus |
 | `B2B_DRIFT_ENABLE` / `B2B_DRIFT_DEADBAND_MS` / `B2B_DRIFT_SLEW_MS_PER_S` | true / 1 / 1 | Verankerung der Zeitachse an der Wanduhr |
 | `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
@@ -511,23 +512,46 @@ voreingestellt (`JACK_REALTIME`).
 
 ## Abgang einer Quelle (S4006)
 
-Trennt sich ein DJ (sauber abgemeldet oder Abriss), verschwinden die JACK-Ports `<name>:receive_N`. Der Router sieht das
-im nächsten Scan (`B2B_ROUTER_INTERVAL_S`). Fehlen die Ports länger als `B2B_SOURCE_GRACE_S` (Vorgabe 5 s; ein kurzer
-Abriss, der binnen der Karenz zurückkehrt, bleibt unbemerkt), gilt die Quelle als getrennt:
+Eine Quelle gilt auf zwei Wegen als getrennt:
 
-* Sie wird aus dem Mixer abgemeldet und **verschwindet aus `status.sources`** (`clients[].present` ist `false`). Es gibt
-  kein `locked=true` / `stale_s=null` einer Geisterquelle mehr.
+1. **Ports weg (saubere Abmeldung).** Sendet der Client beim Ende das JackTrip-Stopp-Paket (SIGINT/Beenden im
+   Programm), entfernt der Hub die JACK-Ports `<name>:receive_N` sofort. Der Router sieht das im nächsten Scan
+   (`B2B_ROUTER_INTERVAL_S`). Fehlen die Ports länger als `B2B_SOURCE_GRACE_S` (Vorgabe 5 s; ein kurzer Abriss, der
+   binnen der Karenz zurückkehrt, bleibt unbemerkt), gilt die Quelle als getrennt. Gemessen am Live-Server: etwa 5 s
+   nach der Abmeldung.
+2. **Ports da, keine Pakete (Abriss ohne Abmeldung: Rechner aus, Netz weg, Prozess getötet).** Ohne Stopp-Paket
+   entfernt der Hub die Ports erst nach seinem UDP-Timeout („UDP WAITED MORE THAN 10 seconds“, im CI-Lauf
+   43754873338 belegt: Client mit SIGTERM beendet, Ports weg nach etwa 11 s, Quelle weg nach etwa 16 s), und
+   manche Abrisse räumt er gar nicht auf. Bleiben bei einem DJ länger als `B2B_SOURCE_SILENCE_S` **alle** Samples
+   exakt 0 (JackTrip schreibt bei ausbleibenden Paketen Nullen), gilt er als getrennt, auch wenn die Ports stehen.
+   Vorgabe 12 s: ein kurzer Aussetzer (WLAN-Wechsel, Routing-Neustart, einige Sekunden) löst nichts aus, ein toter
+   Client ist nach etwa 12,5 s weg (Stille-Frist plus Worker-Block), also unter den rund 15 s, die der Hub plus
+   Karenz bräuchten. Gemessen wird im Worker-Thread je 2048-Frame-Block (`any()` über den Block), nicht im
+   JACK-Callback. Grenze: Wer wirklich länger als die Frist digitale Stille sendet (stummgeschaltet, Player-Pause
+   mit exakten Nullen), gilt ebenfalls als getrennt; sobald wieder Audio kommt, ist er eine neue Quelle (und live,
+   wenn niemand live ist und `B2B_AUTO_ACTIVE=true`). `B2B_SOURCE_SILENCE_S=0` schaltet den Weg aus. Nur DJs
+   (Rolle `dj`) werden so geprüft, nie Zuhörer.
+
+Folgen in beiden Fällen:
+
+* Die Quelle wird aus dem Mixer abgemeldet und **verschwindet aus `status.sources`** (bei Weg 1 ist
+  `clients[].present` `false`, bei Weg 2 bleibt es `true`, solange die Ports stehen). Es gibt kein `locked=true` /
+  `stale_s=null` einer Geisterquelle mehr.
 * War sie live, ist danach **keine Quelle live**: `live=null`, `no_source=true`, das Programm führt Stille, die
   Zeitachse ist offen (Drift-Verankerung verworfen, daher keine `retime`-Ereignisse), die Lags der übrigen Quellen
   werden verworfen und rasten wie die wartender DJs neu ein. **Es gibt keine automatische Übergabe** an einen wartenden
   DJ; `POST /handover` an einen wartenden DJ setzt ihn als ersten live (wie nach dem Start).
-* In `status.events` steht `{"kind": "source_lost", "source": "<name>", "was_live": true|false}`.
+* In `status.events` steht `{"kind": "source_lost", "source": "<name>", "was_live": true|false, "reason":
+  "ports_gone"|"silence"}`.
 * Die Aufnahme (`B2B_RECORD_ONLY_LIVE=true`) endet nach dem Nachlauf von 2 s: `recording_info.state` ist `waiting`.
-* Meldet sich ein Client unter demselben Namen wieder, ist er eine **neue Quelle**: frischer Ring ab Wanduhr der
-  Anmeldung (wie bei spätem Join), kein Altzustand. Ist niemand live und `B2B_AUTO_ACTIVE=true`, wird er live wie der
-  erste DJ nach dem Start.
+  Bei `B2B_RECORD_ONLY_LIVE=false` (dauernd aufnehmen, so der Integrationstest außer in `gone*`) bleibt sie
+  `recording`.
+* Meldet sich ein Client unter demselben Namen wieder (Weg 2: kommt wieder Audio), ist er eine **neue Quelle**: frischer
+  Ring ab Wanduhr der Anmeldung (wie bei spätem Join), kein Altzustand. Ist niemand live und `B2B_AUTO_ACTIVE=true`,
+  wird er live wie der erste DJ nach dem Start.
 
-Regression: `tests/test_live_source_lost.py`; Integrationstest-Profil `gone`.
+Regression: `tests/test_live_source_lost.py` (Ports weg und Stille bei stehenden Ports, kurzer Aussetzer, Rückkehr);
+Integrationstest-Profile `gone` (sauber, SIGINT, Frist Karenz + 5 s) und `gone_hard` (SIGKILL, Frist Stille-Frist + 5 s).
 
 ## Integrationstest (Docker, tc netem)
 
@@ -548,7 +572,8 @@ des Hubs: fest 12 Slots (`--jacktrip-queue`, Vorgabe 12; `auto` wie bisher mögl
 | Profil | netem (Client-Egress) |
 |---|---|
 | `clean` | keine |
-| `gone` | keine; wie `noname`, danach wird der Client beendet: binnen 15 s `no_source=true`, Ereignis `source_lost`, Quelle nicht mehr in `sources`, `recording_info.state == "waiting"` (nur Status, keine Audioauswertung) |
+| `gone` | keine; wie `noname`, Haltezeit `--gone-hold-s` (30 s), danach **saubere Abmeldung** (SIGINT, JackTrip sendet das Stopp-Paket): binnen Karenz `B2B_SOURCE_GRACE_S` (5 s) + 5 s Zuschlag = 10 s `no_source=true`, Ereignis `source_lost`, Quelle nicht mehr in `sources`, danach `recording_info.state == "waiting"` (Stack mit `B2B_RECORD_ONLY_LIVE=true`; nur Status, keine Audioauswertung) |
+| `gone_hard` | wie `gone`, aber **harter Abriss** (SIGKILL des Client-Containers, kein Stopp-Paket, Ports bleiben bis zum Hub-Timeout): binnen Stille-Frist `B2B_SOURCE_SILENCE_S` (12 s) + 5 s = 17 s `no_source=true`; `waiting` 3 s später |
 | `wan40` | `delay 40ms 5ms distribution normal rate 1000mbit` |
 | `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit` |
 | `noname` | keine; nur Server und ein Client **ohne `--remotename`** (`clientN`, Compose-Profil `noname`), der `--late-join-s` (20 s) nach dem Server startet. Der Orchestrator findet seinen Namen (`__ffff_<ip>` o. ä.) über `/status`, setzt ihn live und hält `--noname-hold-s` (90 s); keine Übergabe (S3904) |

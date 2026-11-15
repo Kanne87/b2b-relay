@@ -133,3 +133,86 @@ def test_grace_from_env():
     assert LiveConfig().source_grace_s == 5.0
     with pytest.raises(ValueError):
         LiveConfig.from_env({"B2B_SOURCE_GRACE_S": "-1"})
+
+
+# ---------------------------------------------------------------- Abriss ohne Port-Abbau (Nachfolge S4006)
+# Der Hub entfernt die Ports eines abgerissenen Clients erst nach seinem UDP-Timeout (10 s, im CI-Lauf
+# 43754873338 belegt) oder gar nicht. Die Ports bleiben, JackTrip schreibt Nullen: Stille-Frist B2B_SOURCE_SILENCE_S.
+
+def stalled(gen, name="A", start=0.0, end=1e9):
+    """Wie ``gen``, nur liefert ``name`` zwischen start und end (Frames) exakte Nullen (keine Pakete)."""
+    def g(s, n):
+        d = gen(s, n)
+        if start <= s < end:
+            d = dict(d)
+            d[name] = (np.zeros(n, np.float32), np.zeros(n, np.float32))
+        return d
+    return g
+
+
+def test_silence_while_ports_stay_loses_source(music, tmp_path):
+    cfg = LiveConfig(router_interval_s=0.0, record_dir=str(tmp_path), source_silence_s=12.0)
+    rig = Rig(("A", "B"), cfg=cfg)
+    gen = make_gen(music)
+    rig.run(20.0, gen)
+    assert rig.engine.snapshot()["live"] == "A"
+    g = stalled(gen)
+    rig.run(8.0, g)                                      # unter der Frist: noch live
+    st = rig.engine.snapshot()
+    assert st["live"] == "A" and not kinds(rig, "source_lost")
+    rig.run(7.0, g)                                      # 15 s Stille: über 12 s
+    st = rig.engine.snapshot()
+    assert st["live"] is None and st["no_source"] is True and "A" not in st["sources"] and "B" in st["sources"]
+    ev = kinds(rig, "source_lost")
+    assert len(ev) == 1 and ev[0]["source"] == "A" and ev[0]["was_live"] is True and ev[0]["reason"] == "silence"
+    assert rig.world.ports["A:receive_1"] is not None    # Ports sind weiter da
+    assert [c for c in rig.io.clients() if c["name"] == "A"][0]["present"] is True
+    n0 = retimes(rig)
+    rig.run(8.0, g)
+    assert retimes(rig) == n0                            # keine retime-Flut
+    st = rig.engine.snapshot()
+    assert st["live"] is None and st["recording_info"]["state"] == "waiting"
+    assert len(kinds(rig, "source_lost")) == 1           # nicht erneut gemeldet, keine Pendelei
+
+
+def test_short_dropout_under_limit_does_nothing(music):
+    rig = Rig(("A", "B"), cfg=LiveConfig(router_interval_s=0.0, source_silence_s=12.0))
+    gen = make_gen(music)
+    rig.run(15.0, gen)
+    rig.run(9.0, stalled(gen, start=rig.cyc * 256, end=rig.cyc * 256 + 9 * FS))   # 9 s Aussetzer
+    rig.run(10.0, gen)
+    st = rig.engine.snapshot()
+    assert st["live"] == "A" and not kinds(rig, "source_lost") and not kinds(rig, "source_removed")
+
+
+def test_return_after_silence_is_new_source(music):
+    rig = Rig(("A",), cfg=LiveConfig(router_interval_s=0.0, source_silence_s=5.0))
+    gen = make_gen(music)
+    rig.run(12.0, gen)
+    t0 = rig.cyc * 256
+    rig.run(10.0, stalled(gen, start=t0, end=t0 + 10 * FS))
+    st = rig.engine.snapshot()
+    assert st["no_source"] and "A" not in st["sources"]
+    rig.run(10.0, gen)                                   # Pakete kommen wieder
+    st = rig.engine.snapshot()
+    assert st["live"] == "A" and not st["no_source"]     # neue Quelle, niemand live: auto_active
+    u0 = st["underruns"]
+    rig.run(4.0, gen)
+    st = rig.engine.snapshot()
+    assert st["program_level_db"] > -40.0 and st["underruns"] == u0
+    assert len(kinds(rig, "source_lost")) == 1
+
+
+def test_silence_limit_off_keeps_source(music):
+    rig = Rig(("A",), cfg=LiveConfig(router_interval_s=0.0, source_silence_s=0.0))
+    gen = make_gen(music)
+    rig.run(12.0, gen)
+    rig.run(30.0, stalled(gen))
+    assert rig.engine.snapshot()["live"] == "A" and not kinds(rig, "source_lost")
+
+
+def test_silence_from_env():
+    assert LiveConfig.from_env({"B2B_SOURCE_SILENCE_S": "9"}).source_silence_s == 9.0
+    assert LiveConfig().source_silence_s == 12.0
+    with pytest.raises(ValueError):
+        LiveConfig.from_env({"B2B_SOURCE_SILENCE_S": "-1"})
