@@ -45,7 +45,8 @@ class ClientInfo:
     hears: str | None = None         # "feed:<quelle>" | "program" | None
     ports: Any = None                # unsere Eingangsports (L, R); überleben das Trennen der Quelle
     absent_since: float | None = None    # mono-Zeit, seit der die receive_-Ports fehlen
-    dropped: bool = False            # Quelle ist beim Engine abgemeldet (Karenz überschritten)
+    dropped: bool = False            # Quelle ist beim Engine abgemeldet (Karenz überschritten oder Stille)
+    silent_drop: bool = False        # abgemeldet, obwohl die Ports da sind (keine Pakete): Rückkehr erst bei Audio
 
 
 class JackIO:
@@ -202,7 +203,11 @@ class JackIO:
                 with self._lock:
                     self._clients[name] = info
                 info.dropped = True             # unten wie eine Wiederanmeldung behandeln
-            if info.dropped:
+            if info.dropped and info.silent_drop:
+                di = self.engine.input(name)
+                if di is None or di.revived:
+                    info.silent_drop = False    # Audio ist zurück (oder Eingang weg): wie neu angemeldet
+            if info.dropped and not info.silent_drop:
                 # neue Quelle: frischer Ring ab Wanduhr der Anmeldung, kein Altzustand
                 self.engine.attach(SourceInput(name, info.ports))
                 info.dropped = False
@@ -212,11 +217,20 @@ class JackIO:
             info.present, info.rx, info.tx = True, nrx, sends.get(name, 0)
         now = self._mono()
         gone: list[str] = []
+        silent: list[str] = []
+        limit = self.cfg.source_silence_s
         with self._lock:
             for name, info in self._clients.items():
                 if name in found:
+                    # Ports da, aber keine Pakete: nur DJs, nur wenn die Frist eingestellt ist
+                    if limit > 0 and not info.dropped and info.role == "dj":
+                        si = self.engine.input(name)
+                        if si is not None and si.quiet >= limit * self.engine.fs:
+                            info.dropped = info.silent_drop = True
+                            silent.append(name)
                     continue
                 info.present, info.rx, info.tx = False, 0, 0
+                info.silent_drop = False        # Ports weg: die Wiederkehr ist eine neue Verbindung
                 if info.dropped:
                     continue
                 if info.absent_since is None:
@@ -224,8 +238,10 @@ class JackIO:
                 if now - info.absent_since >= self.cfg.source_grace_s:
                     info.dropped = True
                     gone.append(name)
-        for name in gone:                       # Engine-Aufruf ohne unser Lock
+        for name in gone:                       # Engine-Aufrufe ohne unser Lock
             self.engine.drop_source(name)
+        for name in silent:
+            self.engine.drop_source(name, reason="silence", keep_input=True)
 
     def _connect_all(self) -> None:
         c = self.client
