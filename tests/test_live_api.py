@@ -56,3 +56,13 @@ def test_token_required_when_configured(stereo):
     assert c.get("/status").status_code == 401
     assert c.get("/status", headers={"Authorization": "Bearer geheim"}).status_code == 200
     assert c.post("/handover", json={"to": "A"}).status_code == 401
+
+
+def test_healthz_follows_worker_progress(rig_client):
+    rig, c = rig_client
+    assert c.get("/healthz").status_code == 200
+    rig.now += 30.0                                  # Worker meldet seit 30 s nichts mehr
+    r = c.get("/healthz")
+    assert r.status_code == 503 and "Worker steht" in r.json()["detail"]
+    rig.engine.progress = rig.now                    # Worker lebt wieder
+    assert c.get("/healthz").status_code == 200

@@ -15,6 +15,9 @@ services:
       B2B_AUTO_ACTIVE: "false"          # der Orchestrator bestimmt den ersten Live-DJ
       B2B_RECORD_DIR: /rec
       B2B_RECORD_FORMAT: float32
+      B2B_RECORD_ONLY_LIVE: "false"     # die Auswertung braucht den durchgehenden Mitschnitt
+      B2B_RECORD_SEGMENT_S: "86400"     # eine Datei je Profil (analyze liest genau eine WAV)
+      B2B_RECORD_MAX_MB: "0"
       B2B_DRIFT_BASE_S: "10"
       # Jitterpuffer des Hubs (Slots à 256 Frames): fest statt auto, siehe README "Integrationstest" (S3904)
       JACKTRIP_QUEUE: ${ITEST_JACKTRIP_QUEUE:-12}

@@ -150,7 +150,8 @@ def test_client_leaves_and_returns(stereo):
 
 def test_recording_writes_program_wav(stereo, tmp_path):
     from b2b_relay.live.wav import read_wav
-    cfg = LiveConfig(router_interval_s=0.0, record_dir=str(tmp_path), record_format="float32")
+    cfg = LiveConfig(router_interval_s=0.0, record_dir=str(tmp_path), record_format="float32",
+                     record_only_live=False, record_segment_s=1e6)
     rig = Rig(("A", "B"), cfg=cfg)
     rig.engine._open_record()
     rig.run(8.0, make_gen(stereo))
@@ -187,3 +188,96 @@ def test_worker_thread_path(stereo):
     finally:
         rig.engine.stop()
     assert np.abs(rig.program()[:, 4 * FS:]).max() > 0.05
+
+
+# ---------------------------------------------------------------- Aufnahme: Segmente, Fehler, Platz (S3904 S0)
+
+def _rec(tmp_path, **kw):
+    from b2b_relay.live.recorder import Recorder
+    ev = []
+    cfg = LiveConfig(record_dir=str(tmp_path), record_only_live=False, **kw)
+    return Recorder(cfg, 1000, lambda kind, **d: ev.append({"kind": kind, **d})), ev
+
+
+def test_failing_writer_does_not_stop_engine(stereo, tmp_path):
+    """Nachbildung der 4-GB-Grenze: Schreiber bricht nach N Bytes mit struct.error ab. Vor dem Fix blieb der
+    Worker stehen (Block wurde endlos wiederholt, chunks/proc standen)."""
+    import struct
+    from b2b_relay.live.wav import WavWriter
+
+    class Limited(WavWriter):
+        def write(self, chans):
+            super().write(chans)
+            if self.frames * 4 > 200_000:
+                raise struct.error("'I' format requires 0 <= number <= 4294967295")
+
+    cfg = LiveConfig(router_interval_s=0.0, record_dir=str(tmp_path), record_only_live=False)
+    rig = Rig(("A", "B"), cfg=cfg)
+    rig.engine.rec._factory = Limited
+    rig.engine._open_record()
+    rig.run(15.0, make_gen(stereo))
+    eng = rig.engine
+    assert eng.chunks > 100 and eng.proc > 10 * FS        # Worker zählt weiter
+    assert eng.last_error is None
+    snap = eng.snapshot()
+    errs = [e for e in snap["events"] if e["kind"] == "recording_error"]
+    assert errs and "4294967295" in errs[0]["reason"]
+    assert snap["recording_info"]["errors"] >= 1
+    assert len(list(tmp_path.glob("program-*.wav"))) >= 2   # nach dem Fehler neues Segment
+
+
+def test_segments_are_sample_exact(tmp_path):
+    from b2b_relay.live.wav import read_wav
+    rec, _ = _rec(tmp_path, record_segment_s=2.5)
+    rng = np.random.default_rng(1)
+    sig = rng.uniform(-0.9, 0.9, (2, 1000 * 12)).astype(np.float32)
+    k = 250
+    for i in range(0, sig.shape[1], k):
+        rec.write(sig[0, i:i + k], sig[1, i:i + k], k, True, lambda idx: ['{"k":"blk","i":%d}' % idx])
+    rec.close()
+    wavs = sorted(tmp_path.glob("program-*.wav"))
+    assert len(wavs) == 5 and [w.name for w in wavs] == sorted(w.name for w in wavs)
+    parts = [read_wav(w)[1] for w in wavs]
+    got = np.concatenate(parts)
+    want = np.clip(np.round(sig.T * 32768), -32768, 32767) / 32768
+    assert got.shape == want.shape and np.array_equal(got, want.astype(np.float32))
+    for w in wavs:                                           # Trace wechselt mit, Index je Segment ab 0
+        first = w.with_suffix(".trace.jsonl").read_text().splitlines()[0]
+        assert '"i":0' in first.replace(" ", "")
+
+
+def test_size_limit_deletes_oldest_own_files_only(tmp_path):
+    rec, _ = _rec(tmp_path, record_segment_s=1.0, record_max_mb=1)
+    (tmp_path / "notes.txt").write_text("fremd")
+    (tmp_path / "program-old.txt").write_text("fremd, anderes Muster")
+    (tmp_path / "other.wav").write_bytes(b"x" * 3_000_000)
+    sig = np.zeros(1000, np.float32)
+    for _ in range(40):                                      # 40 Segmente à 4 kB Nutzdaten ... zu klein: Platz füllen
+        rec.write(sig, sig, 1000, True, lambda i: ["{}"])
+    rec.close()
+    own = sorted(tmp_path.glob("program-*.wav"))
+    assert len(own) == 40
+    # jetzt Obergrenze unterschreiten: großes altes Segment anlegen
+    big = tmp_path / "program-00000000-000000-0001.wav"
+    big.write_bytes(b"\0" * 900_000)
+    big2 = tmp_path / "program-00000000-000001-0001.wav"
+    big2.write_bytes(b"\0" * 900_000)
+    rec2, _ = _rec(tmp_path, record_segment_s=1.0, record_max_mb=1)
+    rec2.write(sig, sig, 1000, True, None)
+    rec2.close()
+    assert not big.exists() and not big2.exists()            # älteste weg
+    assert (tmp_path / "notes.txt").exists() and (tmp_path / "program-old.txt").exists()
+    assert (tmp_path / "other.wav").exists()
+    n, total = rec2.stats()
+    assert total <= 1024 * 1024 and n >= 1
+
+
+def test_only_live_records_in_new_segment(tmp_path):
+    from b2b_relay.live.recorder import Recorder
+    cfg = LiveConfig(record_dir=str(tmp_path), record_only_live=True)
+    rec = Recorder(cfg, 1000, lambda *a, **k: None)
+    z = np.zeros(1000, np.float32)
+    for live in [False] * 3 + [True] * 3 + [False] * 6 + [True] * 2:
+        rec.write(z, z, 1000, live, None)
+    rec.close()
+    assert len(list(tmp_path.glob("program-*.wav"))) == 2    # nichts vor der Quelle, neues Segment nach der Pause

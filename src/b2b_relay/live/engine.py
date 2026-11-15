@@ -24,8 +24,6 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -35,7 +33,7 @@ from .config import LiveConfig
 from .drift import DriftMonitor
 from .ring import AudioRing
 from .stats import lag_jitter_ms
-from .wav import WavWriter
+from .recorder import Recorder
 
 RING_FRAMES = 1 << 17           # 131072 Frames = 2,7 s je Quelle / Ausgang
 OUT_PRIME_CHUNKS = 2            # Ausgang beginnt erst mit so vielen Blöcken Vorrat
@@ -110,10 +108,9 @@ class Engine:
         self.proc = 0                                   # globaler Frame-Index, bis zu dem verarbeitet ist
         self._started_mono = 0.0
         self._last_active: str | None = None
-        self._last_label = ""
-        self._wav: WavWriter | None = None
-        self._trace: Any = None                         # JSON-Lines neben dem Mitschnitt (Auswertung)
-        self._trace_frames = 0                          # Frames, die in den Mitschnitt geschrieben sind
+        self._rec_events: deque[dict] = deque(maxlen=20)    # Ereignisse der Aufnahme (recording_error)
+        self.rec = Recorder(cfg, self.fs, self._rec_event)  # segmentierter Mitschnitt, wirft nie
+        self.progress = mono()                          # Zeitpunkt (mono) des letzten fertigen Blocks / Leerlaufs
         self._retime_total = 0                          # Summe aller Umlabel-Schritte (Samples)
         self._last_event: Any = None
         self.load = 0.0                                 # Rechenzeit / Blockdauer (geglättet)
@@ -142,6 +139,10 @@ class Engine:
         fut: Future = Future()
         self._cmds.put((fn, fut))
         return fut.result(timeout)
+
+    def stalled_s(self) -> float:
+        """Sekunden seit dem letzten Lebenszeichen des Workers (fertiger Block oder Leerlauf-Runde)."""
+        return max(0.0, self.mono() - self.progress)
 
     def snapshot(self) -> dict:
         with self._snap_lock:
@@ -189,6 +190,7 @@ class Engine:
     def start(self) -> None:
         self.proc = self.rt.frames
         self._started_mono = self.mono()
+        self.progress = self._started_mono
         self._open_record()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="b2b-worker", daemon=True)
@@ -198,30 +200,25 @@ class Engine:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
-        if self._wav:
-            self._wav.close()
-            self._wav = None
-        if self._trace:
-            self._trace.close()
-            self._trace = None
+        self.rec.close()
 
     def _open_record(self) -> None:
-        if not self.cfg.record_dir:
-            return
-        d = Path(self.cfg.record_dir)
-        d.mkdir(parents=True, exist_ok=True)
-        self._last_label = str(d / datetime.now().strftime("program-%Y%m%d-%H%M%S.wav"))
-        self._wav = WavWriter(self._last_label, self.fs, 2, self.cfg.record_format)
-        self._trace = open(self._last_label[:-4] + ".trace.jsonl", "w", buffering=1)
-        self._trace_frames = 0
+        """Aufnahme bereitmachen; das erste Segment beginnt mit dem ersten aufzunehmenden Block."""
+        self.rec.enabled = bool(self.cfg.record_dir)
+
+    def _rec_event(self, kind: str, **detail: Any) -> None:
+        self._rec_events.append({"t_s": round(self.proc / self.fs, 2), "kind": kind, **detail})
 
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
                 self._drain_cmds()
                 if not self.pump():
+                    self.progress = self.mono()          # Leerlauf (nichts zu tun) ist kein Stillstand
                     time.sleep(0.004)
             except Exception as e:          # Worker darf nie sterben: Fehler melden, weiterlaufen
+                # Hier landen Fehler des Mixers. Der Block wird wiederholt; ein dauerhafter Fehler hält den
+                # Fortschritt an (progress bleibt stehen) - /healthz meldet das (503).
                 self.last_error = f"{type(e).__name__}: {e}"
                 time.sleep(0.05)
 
@@ -295,13 +292,13 @@ class Engine:
             self._prog_quiet = 0
         else:
             self._prog_quiet += k
-        if self._wav:
-            self._wav.write((left, right))
-            if self._trace:
-                self._write_trace(k)
+        if self.rec.enabled:     # wirft nie: Fehler der Aufnahme gehen als Ereignis in den Status
+            self.rec.write(left, right, k, self.master.status.active is not None,
+                           lambda i: self._trace_lines(k, i))
         self.program.write((left, right), k)
         self.proc += k
         self.chunks += 1
+        self.progress = self.mono()
         self._drift_step(k)
         now = self.mono()
         if now >= self._next_snap:
@@ -329,17 +326,18 @@ class Engine:
         n = sum(c for _, c in self._prog_e)
         return max(-120.0, 10.0 * np.log10(e / n + 1e-14)) if n else -120.0
 
-    def _write_trace(self, k: int) -> None:
+    def _trace_lines(self, k: int, idx: int) -> list[str]:
         """Eine Zeile je Block: Mitschnitt-Index → Programmzeit (ohne Umlabeln, "Inhaltszeit"), Rate, Puffer;
         dazu neue Mixer-Ereignisse. Grundlage für ``tests/integration/analyze.py``."""
         m = self.master
+        out: list[str] = []
         lb = m.last_block
         if lb is not None:
-            rec = {"k": "blk", "i": self._trace_frames, "n": k, "Tc": lb.pos - self._retime_total,
+            rec = {"k": "blk", "i": idx, "n": k, "Tc": lb.pos - self._retime_total,
                    "r0": round(lb.r0, 6), "r1": round(lb.r1, 6), "b": round(lb.buffer_s, 4),
                    "wall": m.wall, "drift_ms": round(self.drift.status().drift_ms, 3),
                    "xr": self.rt.xruns, "cc": sum(c for c, _ in m.concealed.values())}
-            self._trace.write(json.dumps(rec) + "\n")
+            out.append(json.dumps(rec))
         evs = list(m.events)
         new = []
         for e in reversed(evs):
@@ -349,11 +347,11 @@ class Engine:
         if evs:
             self._last_event = evs[-1]
         for e in reversed(new):
-            rec = {"k": "ev", "i": self._trace_frames, "wall": e.wall, "kind": e.kind, **e.detail}
+            rec = {"k": "ev", "i": idx, "wall": e.wall, "kind": e.kind, **e.detail}
             if "t_switch" in rec:
                 rec["Tc_switch"] = rec["t_switch"] - self._retime_total
-            self._trace.write(json.dumps(rec, default=str) + "\n")
-        self._trace_frames += k
+            out.append(json.dumps(rec, default=str))
+        return out
 
     def _drift_step(self, k: int) -> None:
         st = self.master.status
@@ -416,9 +414,11 @@ class Engine:
             "worker": {"load": round(self.load, 3), "chunks": self.chunks, "error": self.last_error,
                        "in_dropped": {i.name: i.ring.dropped for i in self.inputs},
                        "out_dropped": self.program.dropped},
-            "recording": self._last_label if self._wav else None,
-            "events": [{"t_s": round(e.wall / self.fs, 2), "kind": e.kind, **e.detail}
-                       for e in list(m.events)[-20:]],
+            "recording": self.rec.current,
+            "recording_info": self.rec.status(),
+            "events": sorted([{"t_s": round(e.wall / self.fs, 2), "kind": e.kind, **e.detail}
+                              for e in list(m.events)[-20:]] + list(self._rec_events),
+                             key=lambda x: x["t_s"]),
         }
         with self._snap_lock:
             self._snap = snap
