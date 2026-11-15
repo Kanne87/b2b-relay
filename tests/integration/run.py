@@ -18,6 +18,10 @@ der Adresse, ``__ffff_<ip>``), der erst ``--late-join-s`` (20 s) nach dem Server
 sich in den laufenden Dienst einwählt. Der Orchestrator findet den Namen über ``/status``, setzt ihn live und
 prüft nach ``--noname-hold-s``, dass das Programm seinen Ton führt (Pegel je Haltezeit, ``underruns`` steigt nicht).
 
+Profil ``gone`` (S4006): wie ``noname``, danach wird der Client beendet. Innerhalb von 15 s muss ``/status``
+``no_source=true`` (``live`` leer, Ereignis ``source_lost``) und ``recording_info.state == "waiting"`` melden;
+die Quelle darf nicht mehr als verbunden gelten. Dieses Profil prüft nur den Status, nicht das Audio.
+
 Bricht ein Profil ab (Zeitüberschreitung, beendeter Container, Fehler der Auswertung), gibt der Lauf die
 letzten ``--log-lines`` (200) Zeilen der Compose-Logs je Container aus (auch nach ``<profil>/logs/``),
 wertet den Mitschnitt aus, soweit er reicht, und schreibt ``analysis.json`` mit Feld ``error``; die übrigen
@@ -50,8 +54,11 @@ PROFILES = {
     "wan40": "delay 40ms 5ms distribution normal rate 1000mbit",
     "wan120": "delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit",
     "noname": "",
+    "gone": "",
 }
-SOLO = {"noname"}           # Profile mit einem einzigen, spät verbundenen Client ohne Remote Name
+GONE = {"gone"}             # Profil gone (S4006): der einzige Client geht, der Server muss das melden
+SOLO = {"noname"} | GONE    # Profile mit einem einzigen, spät verbundenen Client ohne Remote Name
+GONE_DEADLINE_S = 15.0      # nach dem Ende des Clients: no_source=true und Aufnahme 'waiting' innerhalb dieser Zeit
 DJS = ["A", "B", "C"]
 
 
@@ -115,7 +122,7 @@ class Runner:
             return
         r = subprocess.run(self.compose_cmd() + ["ps", "-a", "--status", "exited", "--services"],
                            env={**os.environ, **self.env}, capture_output=True, text=True, check=False)
-        dead = [x for x in r.stdout.split() if x]
+        dead = [x for x in r.stdout.split() if x and x not in getattr(self, "expected_exit", ())]
         if dead:
             raise ProfileAbort(f"Container beendet: {', '.join(dead)}")
 
@@ -140,7 +147,10 @@ class Runner:
         d = self.out / name
         self.proj = f"b2bit-{name}"
         self.solo = name in SOLO
+        self.profile_name = name
         self.client_name: str | None = None
+        self.gone: dict | None = None
+        self.expected_exit: set[str] = set()
         self.env = env = {"NETEM": netem, "ITEST_OUT": str(d), "ITEST_API_PORT": str(a.api_port),
                           "ITEST_JACKTRIP_QUEUE": str(a.jacktrip_queue)}
         compose = self.compose_cmd()
@@ -199,6 +209,11 @@ class Runner:
         if a.dry_run:
             return {"profile": name, "dry_run": True}
         import analyze
+        if name in GONE:
+            res = self._gone_result(name, error)
+            res["jacktrip_queue"] = str(a.jacktrip_queue)
+            (d / "analysis.json").write_text(json.dumps(res, indent=1))
+            return res
         res = None
         wavs = sorted((d / "rec").glob("program-*.wav"))
         if not wavs:
@@ -238,6 +253,8 @@ class Runner:
         self.say("  [3] Namen des Clients aus /status (nicht A/B/C), POST /handover an ihn")
         if a.dry_run:
             self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
+            if self.profile_name in GONE:
+                self.say(f"  [5] Client beenden, innerhalb {GONE_DEADLINE_S:.0f} s no_source=true und Aufnahme 'waiting' erwartet")
             return
         names = self.wait("Client ohne Remote Name verbunden", lambda: self._present() - set(DJS), a.connect_timeout_s)
         self.client_name = sorted(names)[0]
@@ -248,6 +265,49 @@ class Runner:
         self.say(f"  [4] Haltezeit {a.noname_hold_s:.0f} s")
         time.sleep(a.noname_hold_s)
         self.check_alive()
+        if self.profile_name in GONE:
+            self._gone_steps(compose, env)
+
+    def _gone_steps(self, compose: list[str], env: dict) -> None:
+        """Client beenden, dann innerhalb von GONE_DEADLINE_S: no_source, live leer, Ereignis, Aufnahme 'waiting'."""
+        self.say(f"  [5] Client beenden, innerhalb {GONE_DEADLINE_S:.0f} s no_source=true und Aufnahme 'waiting' erwartet")
+        self.expected_exit = {"clientN"}        # beendeter Client ist hier gewollt (check_alive)
+        self.sh(compose + ["stop", "-t", "5", "clientN"], env, check=False)
+        t0 = time.monotonic()
+        g: dict = {"deadline_s": GONE_DEADLINE_S, "no_source_s": None, "waiting_s": None}
+        while time.monotonic() - t0 < GONE_DEADLINE_S + 5:
+            code, js = self.http("GET", "/status", timeout=3)
+            if code == 200:
+                el = round(time.monotonic() - t0, 1)
+                if js.get("no_source") and js.get("live") is None and g["no_source_s"] is None:
+                    g["no_source_s"] = el
+                    g["source_gone"] = self.client_name not in (js.get("sources") or {})
+                    g["source_lost_event"] = any(e.get("kind") == "source_lost" and e.get("source") == self.client_name
+                                                 and e.get("was_live") for e in js.get("events", []))
+                if (js.get("recording_info") or {}).get("state") == "waiting" and g["waiting_s"] is None:
+                    g["waiting_s"] = el
+                if g["no_source_s"] is not None and g["waiting_s"] is not None:
+                    break
+            time.sleep(1.0)
+        self.gone = g
+
+    def _gone_result(self, name: str, error: str | None) -> dict:
+        g = self.gone or {}
+        lim = GONE_DEADLINE_S
+        acc = {"no_source_in_time": g.get("no_source_s") is not None and g["no_source_s"] <= lim,
+               "recording_waiting_in_time": g.get("waiting_s") is not None and g["waiting_s"] <= lim,
+               "source_not_listed": bool(g.get("source_gone")),
+               "source_lost_event": bool(g.get("source_lost_event")),
+               "client_without_remotename": self.client_name is not None and self.client_name not in DJS}
+        res = {"profile": name, "completed": error is None, "error": error, "handovers_effective": 0,
+               "handovers_refused": 0, "fallbacks": 0, "per_handover": [], "summary": {}, "series": [],
+               "client_name": self.client_name, "gone": g}
+        if error:
+            acc = {k: False for k in acc}
+        acc["completed"] = error is None
+        acc["passed"] = all(acc.values())
+        res["acceptance"] = acc
+        return res
 
     def _present(self) -> set[str]:
         code, js = self.http("GET", "/status")
@@ -326,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         if n not in PROFILES:
             ap.error(f"unbekanntes Profil {n!r}")
     r = Runner(a)
-    total = sum((a.late_join_s + a.noname_hold_s if n in SOLO else a.warmup_s + a.handovers * a.hold_s) + a.settle_s
+    total = sum((a.late_join_s + a.noname_hold_s + (GONE_DEADLINE_S if n in GONE else 0) if n in SOLO else a.warmup_s + a.handovers * a.hold_s) + a.settle_s
                 for n in names) / 60
     print(f"Integrationstest: Profile {names}, je {a.handovers} Übergaben in Folge (A→B→C→…), "
           f"{a.hold_s:.0f} s je Übergabe; geschätzt {total:.0f} min ohne Image-Bau")

@@ -43,6 +43,9 @@ class ClientInfo:
     rx: int = 0                      # Zahl der receive_-Ports (Audio vom DJ)
     tx: int = 0                      # Zahl der send_-Ports (Audio zum DJ)
     hears: str | None = None         # "feed:<quelle>" | "program" | None
+    ports: Any = None                # unsere Eingangsports (L, R); überleben das Trennen der Quelle
+    absent_since: float | None = None    # mono-Zeit, seit der die receive_-Ports fehlen
+    dropped: bool = False            # Quelle ist beim Engine abgemeldet (Karenz überschritten)
 
 
 class JackIO:
@@ -146,7 +149,9 @@ class JackIO:
                 raise KeyError(name)
             if info.role == role:
                 return info
-        if role == "listener":
+        if info.dropped:
+            pass                                       # getrennt: beim Wiederkommen gilt die neue Rolle
+        elif role == "listener":
             self.engine.enable_source(name, False)     # wirft, wenn live
         else:
             self.engine.enable_source(name, True)
@@ -192,19 +197,35 @@ class JackIO:
                 info = self._clients.get(name)
             if info is None:
                 role = self.role_of(name)
-                si = SourceInput(name, (c.inports.register(f"in_{_safe(name)}_L"),
-                                        c.inports.register(f"in_{_safe(name)}_R")))
-                self.engine.attach(si)
-                info = ClientInfo(name, role)
+                ports = (c.inports.register(f"in_{_safe(name)}_L"), c.inports.register(f"in_{_safe(name)}_R"))
+                info = ClientInfo(name, role, ports=ports)
                 with self._lock:
                     self._clients[name] = info
-                if role == "dj":
+                info.dropped = True             # unten wie eine Wiederanmeldung behandeln
+            if info.dropped:
+                # neue Quelle: frischer Ring ab Wanduhr der Anmeldung, kein Altzustand
+                self.engine.attach(SourceInput(name, info.ports))
+                info.dropped = False
+                if info.role == "dj":
                     self.engine.enable_source(name, True)
+            info.absent_since = None
             info.present, info.rx, info.tx = True, nrx, sends.get(name, 0)
+        now = self._mono()
+        gone: list[str] = []
         with self._lock:
             for name, info in self._clients.items():
-                if name not in found:
-                    info.present, info.rx, info.tx = False, 0, 0
+                if name in found:
+                    continue
+                info.present, info.rx, info.tx = False, 0, 0
+                if info.dropped:
+                    continue
+                if info.absent_since is None:
+                    info.absent_since = now
+                if now - info.absent_since >= self.cfg.source_grace_s:
+                    info.dropped = True
+                    gone.append(name)
+        for name in gone:                       # Engine-Aufruf ohne unser Lock
+            self.engine.drop_source(name)
 
     def _connect_all(self) -> None:
         c = self.client

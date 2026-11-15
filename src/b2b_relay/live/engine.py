@@ -166,6 +166,30 @@ class Engine:
             si.enabled = enabled
         return self.call(run)
 
+    def drop_source(self, name: str) -> bool:
+        """Quelle getrennt (JACK-Ports weg, Karenz um): aus Mixer und Eingängen nehmen. War sie live, ist danach
+        keine Quelle live (Stille, kein Auto-Übergang); Ereignis ``source_lost``. Gibt zurück, ob sie live war."""
+        def run():
+            was_live = self.master.status.active == name
+            known = name in self._registered
+            if known:
+                self.master.remove_source(name)
+                self.side.remove_source(name)
+                self._registered.remove(name)
+                self._l.pop(name, None)
+                self._r.pop(name, None)
+            self.inputs = tuple(i for i in self.inputs if i.name != name)
+            if was_live:
+                # Zeitachse offen: Verankerung und Bezug der Drift-Regelung verwerfen
+                self.drift = DriftMonitor(self.fs, enable=self.cfg.drift_enable,
+                                          deadband_ms=self.cfg.drift_deadband_ms,
+                                          slew_ms_per_s=self.cfg.drift_slew_ms_per_s)
+                self._last_active = None
+            if known:
+                self._rec_event("source_lost", source=name, was_live=was_live)
+            return was_live
+        return self.call(run)
+
     def _set_first(self, name: str) -> None:
         self.master.set_active(name)
         self.master.retime(-self._base)

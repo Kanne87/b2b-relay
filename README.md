@@ -396,6 +396,7 @@ Ubuntu 24.04, Python-Paket mit Extra `[live]`. Ohne Docker: `pip install -e .[li
 | `B2B_RECORD_SEGMENT_S` | 1800 | Aufnahme in Segmenten dieser Dauer (`program-<Start>-<Nr>.wav` + `.trace.jsonl`, nach Name sortierbar); eine WAV trägt höchstens 4 GiB (pcm16 stereo 48 kHz ≈ 6,2 h) |
 | `B2B_RECORD_MAX_MB` | 2048 | Obergrenze für die eigenen Dateien (`program-*.wav`, `program-*.trace.jsonl`) im Aufnahmeverzeichnis; darüber werden die ältesten Segmente gelöscht, andere Dateien nie. 0 = unbegrenzt |
 | `B2B_RECORD_ONLY_LIVE` | true | Nur aufnehmen, solange eine Quelle live ist (2 s Nachlauf); mit der nächsten Quelle beginnt ein neues Segment |
+| `B2B_SOURCE_GRACE_S` | 5 | Karenz, die fehlende JACK-Ports (`<name>:receive_N`) einer Quelle toleriert; danach gilt sie als getrennt (siehe „Abgang einer Quelle“) |
 | `B2B_HEALTH_STALL_S` | 10 | Steht der Worker länger, antwortet `/healthz` mit 503 (Docker-HEALTHCHECK schlägt fehl). 0 = aus |
 | `B2B_DRIFT_ENABLE` / `B2B_DRIFT_DEADBAND_MS` / `B2B_DRIFT_SLEW_MS_PER_S` | true / 1 / 1 | Verankerung der Zeitachse an der Wanduhr |
 | `B2B_IGNORE_CLIENTS` | system,JackTrip,… | JACK-Clients, die nie als DJ gelten |
@@ -508,6 +509,26 @@ von 2048 Frames; der Programmausgang hat ohnehin 3 s Puffer. Der Callback ist Py
 (`sys.setswitchinterval(0.0005)`); xruns zählt der JACK-Callback (`jack.xruns`). Kein Echtzeit-Scheduling im Container
 voreingestellt (`JACK_REALTIME`).
 
+## Abgang einer Quelle (S4006)
+
+Trennt sich ein DJ (sauber abgemeldet oder Abriss), verschwinden die JACK-Ports `<name>:receive_N`. Der Router sieht das
+im nächsten Scan (`B2B_ROUTER_INTERVAL_S`). Fehlen die Ports länger als `B2B_SOURCE_GRACE_S` (Vorgabe 5 s; ein kurzer
+Abriss, der binnen der Karenz zurückkehrt, bleibt unbemerkt), gilt die Quelle als getrennt:
+
+* Sie wird aus dem Mixer abgemeldet und **verschwindet aus `status.sources`** (`clients[].present` ist `false`). Es gibt
+  kein `locked=true` / `stale_s=null` einer Geisterquelle mehr.
+* War sie live, ist danach **keine Quelle live**: `live=null`, `no_source=true`, das Programm führt Stille, die
+  Zeitachse ist offen (Drift-Verankerung verworfen, daher keine `retime`-Ereignisse), die Lags der übrigen Quellen
+  werden verworfen und rasten wie die wartender DJs neu ein. **Es gibt keine automatische Übergabe** an einen wartenden
+  DJ; `POST /handover` an einen wartenden DJ setzt ihn als ersten live (wie nach dem Start).
+* In `status.events` steht `{"kind": "source_lost", "source": "<name>", "was_live": true|false}`.
+* Die Aufnahme (`B2B_RECORD_ONLY_LIVE=true`) endet nach dem Nachlauf von 2 s: `recording_info.state` ist `waiting`.
+* Meldet sich ein Client unter demselben Namen wieder, ist er eine **neue Quelle**: frischer Ring ab Wanduhr der
+  Anmeldung (wie bei spätem Join), kein Altzustand. Ist niemand live und `B2B_AUTO_ACTIVE=true`, wird er live wie der
+  erste DJ nach dem Start.
+
+Regression: `tests/test_live_source_lost.py`; Integrationstest-Profil `gone`.
+
 ## Integrationstest (Docker, tc netem)
 
 ```bash
@@ -527,6 +548,7 @@ des Hubs: fest 12 Slots (`--jacktrip-queue`, Vorgabe 12; `auto` wie bisher mögl
 | Profil | netem (Client-Egress) |
 |---|---|
 | `clean` | keine |
+| `gone` | keine; wie `noname`, danach wird der Client beendet: binnen 15 s `no_source=true`, Ereignis `source_lost`, Quelle nicht mehr in `sources`, `recording_info.state == "waiting"` (nur Status, keine Audioauswertung) |
 | `wan40` | `delay 40ms 5ms distribution normal rate 1000mbit` |
 | `wan120` | `delay 120ms 20ms distribution normal loss 0.5% reorder 5% 50% rate 1000mbit` |
 | `noname` | keine; nur Server und ein Client **ohne `--remotename`** (`clientN`, Compose-Profil `noname`), der `--late-join-s` (20 s) nach dem Server startet. Der Orchestrator findet seinen Namen (`__ffff_<ip>` o. ä.) über `/status`, setzt ihn live und hält `--noname-hold-s` (90 s); keine Übergabe (S3904) |
