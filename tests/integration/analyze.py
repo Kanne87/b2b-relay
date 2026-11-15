@@ -48,6 +48,7 @@ LIMITS = {   # Abnahmegrenzen je Profil (ms bzw. Anzahl); Lücken: Aussetzer der
     "wan120": dict(phase_ms=10.0, unexplained_gaps=0),
     # ein DJ ohne --remotename, verbindet sich spät, keine Übergabe: nur Ton, Puffer, Lücken
     "noname": dict(phase_ms=None, unexplained_gaps=0),
+    # Profil gone (S4006) prüft nur den Status (run.py), keine Audioauswertung
 }
 SILENT_DB = -60.0           # 1-s-Block des Programms darunter: stumm
 AUDIBLE_AFTER_S = 5.0       # Haltezeit gilt ab so viel nach dem Hörbarwerden / Umschaltpunkt (Puffer 3 s + Einblenden)
@@ -296,7 +297,9 @@ def markdown(results: list[dict]) -> str:
     for r in results:
         s = r["summary"]
         if not s:
-            out.append(f"| {r['profile']} | – | – | – | – | – | – | – | – | – | – | – | – | abgebrochen |")
+            ok = r.get("gone") is not None and r["acceptance"]["passed"]
+            out.append(f"| {r['profile']} | – | – | – | – | – | – | – | – | – | – | – | – | "
+                       f"{'bestanden (nur Status)' if ok else 'abgebrochen'} |")
             continue
         out.append(f"| {r['profile']} | {r['handovers_effective']} | {s['phase_jump_max_abs_ms']} | "
                    f"{s['phase_jump_mean_abs_ms']} | {s.get('null_jump_max_abs_ms')} | {s['gaps_total']} | {s['max_gap_ms']} | {s.get('concealed')} | "
@@ -319,6 +322,11 @@ def markdown(results: list[dict]) -> str:
         if r.get("holds"):
             out += ["", "Programmpegel je Haltezeit (RMS / leisester 1-s-Block, dBFS): "
                     + ", ".join(f"{h['from_s']}–{h['to_s']} s: {h['level_db']}/{h['min_block_db']}" for h in r["holds"])]
+        if r.get("gone") is not None:
+            g = r["gone"]
+            out += ["", f"Client beendet: no_source nach {g.get('no_source_s')} s, Aufnahme 'waiting' nach "
+                    f"{g.get('waiting_s')} s (Frist {g.get('deadline_s')} s), Quelle verschwunden: {g.get('source_gone')}, "
+                    f"Ereignis source_lost: {g.get('source_lost_event')}."]
         if r.get("client_name"):
             out += ["", f"Client ohne Remote Name erschien als `{r['client_name']}`."]
         failed = [k for k, v in r["acceptance"].items() if not v]

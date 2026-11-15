@@ -159,7 +159,8 @@ def test_runner_dry_run_shows_plan_without_docker():
     assert out.returncode == 0, out.stderr
     txt = out.stdout
     for needle in ("clean", "wan40", "wan120", "delay 40ms 5ms", "loss 0.5%", "docker compose", "10 Übergaben",
-                   "POST /handover", "analyze", "noname", "--profile noname up -d --build clientN", "ohne --remotename"):
+                   "POST /handover", "analyze", "noname", "--profile noname up -d --build clientN", "ohne --remotename",
+                   "gone", "Client beenden"):
         assert needle in txt, needle
     one = subprocess.run([sys.executable, str(ITEST / "run.py"), "--dry-run", "--profiles", "clean", "--handovers", "2"],
                          capture_output=True, text=True, timeout=60)
@@ -207,3 +208,20 @@ def test_mark_incomplete_keeps_measurements(tmp_path):
     assert res["per_handover"][0]["phase_jump_ms"] == pytest.approx(0.4, abs=0.1)
     assert res["acceptance"]["passed"] is False and res["error"] == "TimeoutError: x"
     assert "Abgebrochen" in analyze.markdown([res])
+
+
+def test_gone_profile_result_and_report():
+    """Profil gone (S4006): Abnahme aus den Statuswerten, ohne Audioauswertung; Bericht zeigt es als bestanden."""
+    import argparse
+    import run
+    r = run.Runner(argparse.Namespace(out="/tmp/x", api_port=1, dry_run=True))
+    r.client_name = "__ffff_10.0.0.9"
+    r.gone = {"deadline_s": 15.0, "no_source_s": 6.0, "waiting_s": 7.0, "source_gone": True, "source_lost_event": True}
+    res = r._gone_result("gone", None)
+    assert res["acceptance"]["passed"]
+    assert "bestanden (nur Status)" in analyze.markdown([res])
+    r.gone = dict(r.gone, no_source_s=None)
+    bad = r._gone_result("gone", None)
+    assert not bad["acceptance"]["passed"] and not bad["acceptance"]["no_source_in_time"]
+    r.gone = dict(r.gone, no_source_s=16.0)
+    assert not r._gone_result("gone", None)["acceptance"]["passed"]
